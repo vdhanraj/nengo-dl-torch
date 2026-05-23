@@ -23,8 +23,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
+%matplotlib inline
 import matplotlib.pyplot as plt
 import nengo
 from nengo import spa
@@ -132,8 +131,7 @@ plt.xlabel("Vocabulary item index")
 plt.ylabel("Cosine similarity")
 plt.title("Output similarity to vocabulary (baseline, red = target)")
 plt.tight_layout()
-plt.savefig("/tmp/spa_retrieval_baseline.png", dpi=100)
-print("Baseline plot saved to /tmp/spa_retrieval_baseline.png")
+plt.show()
 
 
 # ── 5. Train ──────────────────────────────────────────────────────────────────
@@ -176,8 +174,7 @@ plt.xlabel("Vocabulary item index")
 plt.ylabel("Cosine similarity")
 plt.title("Output similarity to vocabulary (trained, red = target)")
 plt.tight_layout()
-plt.savefig("/tmp/spa_retrieval_trained.png", dpi=100)
-print("Trained plot saved to /tmp/spa_retrieval_trained.png")
+plt.show()
 
 
 # ── 7. Training loss curve ────────────────────────────────────────────────────
@@ -187,8 +184,7 @@ plt.xlabel("Epoch")
 plt.ylabel("MSE loss")
 plt.title("SPA retrieval training loss")
 plt.tight_layout()
-plt.savefig("/tmp/spa_retrieval_loss.png", dpi=100)
-print("Loss curve saved to /tmp/spa_retrieval_loss.png")
+plt.show()
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────

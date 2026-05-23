@@ -43,7 +43,9 @@ class Converter:
         Synapse to apply on all connections (default None for no filtering).
     activation_type : str
         Neuron type to use for activations.
-        Options: ``'rectified_linear'``, ``'lif'``, ``'softlif'``.
+        Options: ``'rectified_linear'``, ``'spiking_relu'``, ``'lif'``,
+        ``'softlif'``.  Use ``'spiking_relu'`` for a network that behaves
+        like ReLU in rate mode and emits discrete spikes in spiking mode.
 
     Examples
     --------
@@ -95,9 +97,15 @@ class Converter:
 
     def _get_neuron_type(self) -> nengo.neurons.NeuronType:
         """Return the Nengo neuron type to use for activations."""
-        a = self.activation_type.lower()
+        a = self.activation_type.lower().replace("-", "_")
+        # amplitude=1/scale_firing_rates ensures probe values match the original
+        # activations in rate mode while firing rates are scaled up to scale Hz.
+        amp = (1.0 / self.scale_firing_rates
+               if self.scale_firing_rates is not None else 1.0)
         if a in ("relu", "rectified_linear", "rectifiedlinear"):
-            return nengo.RectifiedLinear()
+            return nengo.RectifiedLinear(amplitude=amp)
+        elif a in ("spiking_relu", "spikingrectifiedlinear", "spiky_relu"):
+            return nengo.SpikingRectifiedLinear(amplitude=amp)
         elif a == "lif":
             return nengo.LIF()
         elif a in ("softlif", "soft_lif"):
@@ -112,7 +120,7 @@ class Converter:
                 f"Unknown activation_type '{self.activation_type}'; "
                 "using RectifiedLinear."
             )
-            return nengo.RectifiedLinear()
+            return nengo.RectifiedLinear(amplitude=amp)
 
     def _convert(self, model: nn.Module):
         """Walk the model and build the Nengo network."""
@@ -165,7 +173,14 @@ class Converter:
                 )
 
     def _convert_linear(self, name, layer: nn.Linear, prev_node, prev_size):
-        """Convert nn.Linear to a Nengo Ensemble + connection."""
+        """Convert nn.Linear to a Nengo Ensemble + connection.
+
+        When ``scale_firing_rates=S`` is set:
+        - neuron gains are set to S so neurons fire at up to S Hz
+        - neuron type amplitude is set to 1/S (see ``_get_neuron_type``)
+        - result: probe(ens.neurons) == amplitude * rate == relu(W*x+b) in rate mode
+        - weights and biases are kept at their original PyTorch values
+        """
         in_size = layer.in_features
         out_size = layer.out_features
         weights = layer.weight.data.cpu().numpy()  # (out, in)
@@ -179,12 +194,13 @@ class Converter:
             prev_node = node
             prev_size = in_size
 
-        # Scale weights if firing rate scaling is requested
-        if self.scale_firing_rates is not None:
-            scale = 1.0 / self.scale_firing_rates
-            weights = weights * scale
-            if bias is not None:
-                bias = bias * scale
+        # gain controls peak firing rate; amplitude in neuron type rescales output.
+        # Because J = gain * (W@x) + bias, the effective bias contribution to the
+        # probe is (amplitude * gain * ... + amplitude * bias).  To keep the bias
+        # acting in the same units as the weights, scale bias by gain here.
+        scale = float(self.scale_firing_rates) if self.scale_firing_rates else 1.0
+        gain = np.full(out_size, scale)
+        bias_scaled = (bias * scale) if bias is not None else np.zeros(out_size)
 
         # Output ensemble
         neuron_type = self._get_neuron_type()
@@ -192,12 +208,12 @@ class Converter:
             out_size,
             dimensions=1,
             neuron_type=neuron_type,
-            gain=np.ones(out_size),
-            bias=bias if bias is not None else np.zeros(out_size),
+            gain=gain,
+            bias=bias_scaled,
             label=name,
         )
 
-        # Connection with the weight matrix as transform
+        # Connection with the weight matrix as transform (unscaled)
         nengo.Connection(
             prev_node,
             ens.neurons,

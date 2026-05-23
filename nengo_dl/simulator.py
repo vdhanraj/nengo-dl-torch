@@ -291,20 +291,51 @@ class Simulator:
         show_pbar = self.progress_bar if progress_bar is None else progress_bar
         rate_mode = _inference_mode_to_rate(inference_mode)
 
-        if not stateful:
-            self.tensor_graph.reset_state()
+        # Determine if data has more samples than minibatch_size and needs chunking.
+        n_total = None
+        if data is not None:
+            for v in data.values():
+                arr = np.asarray(v) if not isinstance(v, np.ndarray) else v
+                if arr.ndim == 3:
+                    n_total = arr.shape[0]
+                    break
 
-        with torch.no_grad():
-            results = self.tensor_graph.forward(
-                n_steps=n_steps,
-                input_data=data,
-                training=False,
-                rate_mode=rate_mode,
-            )
+        if n_total is not None and n_total > self.minibatch_size:
+            # Process in minibatch_size chunks and concatenate probe results.
+            chunk_results: Dict = {}
+            for start in range(0, n_total, self.minibatch_size):
+                end = min(start + self.minibatch_size, n_total)
+                if end - start < self.minibatch_size:
+                    break  # skip incomplete final batch
+                batch_data = {k: np.asarray(v)[start:end] for k, v in data.items()}
+                if not stateful:
+                    self.tensor_graph.reset_state()
+                with torch.no_grad():
+                    batch_results = self.tensor_graph.forward(
+                        n_steps=n_steps,
+                        input_data=batch_data,
+                        training=False,
+                        rate_mode=rate_mode,
+                    )
+                for probe, tensor in batch_results.items():
+                    chunk_results.setdefault(probe, []).append(tensor.cpu())
+            for probe, tensors in chunk_results.items():
+                combined = torch.cat(tensors, dim=0)
+                self.data._store_probe(probe, combined)
+        else:
+            if not stateful:
+                self.tensor_graph.reset_state()
 
-        # Store probe data
-        for probe, tensor in results.items():
-            self.data._store_probe(probe, tensor)
+            with torch.no_grad():
+                results = self.tensor_graph.forward(
+                    n_steps=n_steps,
+                    input_data=data,
+                    training=False,
+                    rate_mode=rate_mode,
+                )
+
+            for probe, tensor in results.items():
+                self.data._store_probe(probe, tensor)
 
         # Always accumulate total step count; stateful only controls signal state
         self._n_steps += n_steps

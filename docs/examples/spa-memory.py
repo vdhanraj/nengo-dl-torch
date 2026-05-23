@@ -34,8 +34,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
+%matplotlib inline
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -259,8 +258,7 @@ axes[1].set_title("Memory similarity (after training)")
 axes[1].set_xlabel("Time (s)")
 
 plt.tight_layout()
-plt.savefig("/tmp/spa_memory_simple.png", dpi=100)
-print("Simple-memory plot saved to /tmp/spa_memory_simple.png")
+plt.show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,8 +378,7 @@ axes[1].set_title("Binding retrieval (after training)")
 axes[1].set_xlabel("Time (s)")
 
 plt.tight_layout()
-plt.savefig("/tmp/spa_memory_binding.png", dpi=100)
-print("Binding plot saved to /tmp/spa_memory_binding.png")
+plt.show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,8 +396,7 @@ ax2.set_xlabel("Epoch")
 ax2.set_ylabel("NaN-MSE")
 
 plt.tight_layout()
-plt.savefig("/tmp/spa_memory_loss.png", dpi=100)
-print("Loss curves saved to /tmp/spa_memory_loss.png")
+plt.show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

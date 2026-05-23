@@ -26,8 +26,7 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-import matplotlib
-matplotlib.use("Agg")
+%matplotlib inline
 import matplotlib.pyplot as plt
 import nengo
 from nengo.utils.filter_design import cont2discrete
@@ -79,8 +78,7 @@ axes[1].imshow(train_images[0].reshape(8, -1), cmap="gray")
 axes[1].set_title("Permuted pixel sequence (8 rows)")
 axes[1].axis("off")
 plt.tight_layout()
-plt.savefig("/tmp/lmu_input.png", dpi=100)
-print("Input visualisation saved to /tmp/lmu_input.png")
+plt.show()
 
 # ── 2. LMU cell as a Nengo Network ───────────────────────────────────────────
 class LMUCell(nengo.Network):
@@ -231,8 +229,7 @@ plt.xlabel("Epoch")
 plt.ylabel("Cross-entropy loss")
 plt.title("LMU training loss (psMNIST)")
 plt.tight_layout()
-plt.savefig("/tmp/lmu_loss.png", dpi=100)
-print("Loss curve saved to /tmp/lmu_loss.png")
+plt.show()
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("""
