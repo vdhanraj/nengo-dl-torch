@@ -1,14 +1,70 @@
-"""Compatibility tests: nengo-dl vs reference Nengo CPU simulator.
+# pylint: disable=missing-docstring
+"""Compatibility tests: compat utilities and nengo-dl vs reference Nengo.
 
-These tests verify that nengo-dl produces outputs consistent with the
-reference Nengo simulator for operations that should be numerically identical
-(e.g., Node→Node signal passing, deterministic probes).
+Covers:
+  - FrozenOrderedSet (matches original test_compat.py)
+  - Numerical compatibility between nengo-dl and the reference Nengo simulator
 """
 
 import numpy as np
 import pytest
 import nengo
 import nengo_dl
+from nengo_dl import compat
+
+
+# ---------------------------------------------------------------------------
+# FrozenOrderedSet (original: test_ordered_set in nengo_dl/tests/test_compat.py)
+# ---------------------------------------------------------------------------
+
+def test_ordered_set():
+    my_tuple = ("c", "b", "a")
+    my_frozen_set = compat.FrozenOrderedSet(my_tuple)
+
+    # order is preserved
+    assert tuple(my_frozen_set) == my_tuple
+
+    # test member functions
+    for x in my_tuple:
+        assert x in my_frozen_set
+
+    assert "z" not in my_frozen_set
+
+    assert len(my_frozen_set) == len(my_tuple)
+
+    # hashable
+    assert {my_frozen_set: "val"}[my_frozen_set] == "val"
+
+
+def test_frozen_ordered_set_no_duplicates():
+    items = ("a", "b", "a", "c", "b")
+    fos = compat.FrozenOrderedSet(items)
+    assert len(fos) == 3
+    assert tuple(fos) == ("a", "b", "c")
+
+
+def test_frozen_ordered_set_empty():
+    fos = compat.FrozenOrderedSet([])
+    assert len(fos) == 0
+    assert list(fos) == []
+    # Empty sets should be equal and have the same hash
+    fos2 = compat.FrozenOrderedSet([])
+    assert fos == fos2
+    assert hash(fos) == hash(fos2)
+
+
+def test_frozen_ordered_set_equality():
+    a = compat.FrozenOrderedSet(["x", "y", "z"])
+    b = compat.FrozenOrderedSet(["x", "y", "z"])
+    c = compat.FrozenOrderedSet(["z", "y", "x"])  # different order
+    assert a == b
+    assert a != c
+
+
+def test_frozen_ordered_set_repr():
+    fos = compat.FrozenOrderedSet(["a", "b"])
+    r = repr(fos)
+    assert "FrozenOrderedSet" in r
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 import nengo
 import nengo_dl
 
@@ -103,6 +104,45 @@ class TestRunSteps:
         with nengo_dl.Simulator(net, dt=0.001, seed=0) as sim:
             sim.run(0.01)  # 10 steps at dt=0.001
             assert sim.data[p].shape[0] == 10
+
+    def test_lif_inference_modes(self):
+        import warnings
+        with nengo.Network(seed=0) as net:
+            nengo_dl.configure_settings(lif_smoothing=0.01)
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(
+                1,
+                1,
+                neuron_type=nengo.LIF(amplitude=0.01),
+                gain=nengo.dists.Choice([1]),
+                bias=nengo.dists.Choice([0]),
+                encoders=nengo.dists.Choice([[1]]),
+            )
+            nengo.Connection(inp, ens.neurons, transform=np.ones((1, 1)), synapse=None)
+            p = nengo.Probe(ens.neurons, synapse=None)
+
+        x = np.ones((1, 1, 1), dtype=np.float32) * 3.0
+        # Nengo emits a benign RuntimeWarning from log1p when bias=0 is used
+        # with the LIF rate equation; filter it out since it's not our code.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", "divide by zero", RuntimeWarning)
+            with nengo_dl.Simulator(net, seed=0) as sim:
+                sim.run_steps(1, data={inp: x}, inference_mode="rate")
+                rate_data = sim.data[p]
+
+            with nengo_dl.Simulator(net, seed=0) as sim:
+                sim.run_steps(1, data={inp: x}, inference_mode="spiking")
+                spiking_data = sim.data[p]
+
+        assert rate_data.shape == spiking_data.shape == (1, 1)
+        assert rate_data[0, 0] > 0
+        assert not np.isclose(rate_data[0, 0], spiking_data[0, 0])
+
+    def test_unknown_inference_mode_raises(self):
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            with pytest.raises(ValueError, match="inference_mode"):
+                sim.run_steps(1, inference_mode="banana")
 
     def test_probe_raises_without_run(self):
         net, inp, out, p = _make_simple_net()
@@ -241,6 +281,40 @@ class TestSaveLoadParams:
 
         for k in w1:
             np.testing.assert_allclose(w1[k], w2[k], rtol=1e-5)
+
+    def test_save_load_includes_torch_layer_weights(self, tmp_path):
+        def make_net(weight, bias):
+            linear = nn.Linear(2, 2)
+            with torch.no_grad():
+                linear.weight.copy_(torch.tensor(weight, dtype=torch.float32))
+                linear.bias.copy_(torch.tensor(bias, dtype=torch.float32))
+
+            with nengo.Network(seed=0) as net:
+                inp = nengo.Node(np.zeros(2))
+                out = nengo_dl.Layer(linear)(inp)
+                p = nengo.Probe(out, synapse=None)
+
+            return net, inp, p
+
+        path = str(tmp_path / "torch_weights")
+        x = np.array([[[1.0, -1.0]]], dtype=np.float32)
+
+        net1, inp1, p1 = make_net([[1.0, 2.0], [3.0, 4.0]], [0.5, -0.5])
+        with nengo_dl.Simulator(net1, seed=0) as sim1:
+            sim1.run_steps(1, data={inp1: x})
+            expected = sim1.data[p1].copy()
+            weights = sim1.get_weights()
+            sim1.save_params(path)
+
+        assert any(k.startswith("torch_module_") for k in weights)
+
+        net2, inp2, p2 = make_net([[0.0, 0.0], [0.0, 0.0]], [0.0, 0.0])
+        with nengo_dl.Simulator(net2, seed=1) as sim2:
+            sim2.load_params(path)
+            sim2.run_steps(1, data={inp2: x})
+            actual = sim2.data[p2]
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -381,3 +455,313 @@ class TestTrainableParams:
             n_frozen = len(sim_frozen.trainable_params())
 
         assert n_frozen <= n_trainable
+
+
+# ---------------------------------------------------------------------------
+# Persistent state (original: test_persistent_state)
+# ---------------------------------------------------------------------------
+
+class TestPersistentState:
+    def test_run_reset_run_same_output(self):
+        """run → reset_state → run with same input gives identical output."""
+        net, inp, p_v, p_out = _make_lif_net()
+        x = np.ones((1, 30, 1), dtype=np.float32) * 1.5
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(30, data={inp: x})
+            out1 = sim.data[p_out].copy()
+            sim.reset_state()
+            sim.run_steps(30, data={inp: x})
+            out2 = sim.data[p_out].copy()
+
+        np.testing.assert_allclose(out1, out2, rtol=1e-4,
+                                   err_msg="After reset_state, re-run must give same output")
+
+    def test_stateful_accumulates_state(self):
+        """stateful=True: two 10-step runs should differ from stateful=False."""
+        net, inp, p_v, p_out = _make_lif_net()
+        x = np.ones((1, 10, 1), dtype=np.float32) * 2.0
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            # stateful=False: resets between calls
+            sim.run_steps(10, data={inp: x}, stateful=False)
+            out_nstateful_1 = sim.data[p_v].copy()
+            sim.run_steps(10, data={inp: x}, stateful=False)
+            out_nstateful_2 = sim.data[p_v].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            # stateful=True: state carries over
+            sim.run_steps(10, data={inp: x}, stateful=True)
+            out_stateful_1 = sim.data[p_v].copy()
+            sim.run_steps(10, data={inp: x}, stateful=True)
+            out_stateful_2 = sim.data[p_v].copy()
+
+        # The two runs under stateful=False should be identical (reset each time)
+        np.testing.assert_allclose(out_nstateful_1, out_nstateful_2, rtol=1e-4)
+        # The two runs under stateful=True will differ (state carries over)
+        # At minimum the outputs should not be identical
+        assert not np.allclose(out_stateful_1, out_stateful_2, rtol=1e-4), (
+            "stateful=True: second run should differ because state accumulated"
+        )
+
+    def test_n_steps_counter(self):
+        """n_steps property counts total steps simulated."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            assert sim.n_steps == 0
+            sim.run_steps(10)
+            assert sim.n_steps == 10
+            sim.run_steps(5)
+            assert sim.n_steps == 15
+            sim.reset_state()
+            assert sim.n_steps == 0
+
+    def test_time_property(self):
+        """time property equals n_steps * dt."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, dt=0.001, seed=0) as sim:
+            sim.run_steps(7)
+            assert sim.time == pytest.approx(0.007)
+
+
+# ---------------------------------------------------------------------------
+# SimulationData – deep key access (original: test_simulation_data)
+# ---------------------------------------------------------------------------
+
+class TestSimulationDataKeys:
+    def test_ensemble_has_gain_bias(self):
+        """sim.data[ens] must contain 'gain' and 'bias'."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            params = sim.data[ens]
+
+        assert isinstance(params, dict), "sim.data[ens] should return a dict"
+        assert "gain" in params, "Missing 'gain' key"
+        assert "bias" in params, "Missing 'bias' key"
+
+    def test_ensemble_gain_bias_shapes(self):
+        """gain and bias shapes match n_neurons."""
+        n_neurons = 15
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(n_neurons, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            params = sim.data[ens]
+
+        assert params["gain"].shape == (n_neurons,), (
+            f"gain shape {params['gain'].shape} != ({n_neurons},)"
+        )
+        assert params["bias"].shape == (n_neurons,), (
+            f"bias shape {params['bias'].shape} != ({n_neurons},)"
+        )
+
+    def test_ensemble_encoders_present(self):
+        """sim.data[ens] must contain 'encoders' or 'scaled_encoders'."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(2))
+            ens = nengo.Ensemble(10, 2, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            params = sim.data[ens]
+
+        assert "encoders" in params or "scaled_encoders" in params, (
+            "sim.data[ens] must contain 'encoders' or 'scaled_encoders'"
+        )
+
+    def test_connection_has_weights(self):
+        """sim.data[conn] should not raise and returns params info."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(2))
+            ens = nengo.Ensemble(5, 2, seed=0)
+            conn = nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            conn_data = sim.data[conn]
+        # Must not raise; return value is None, dict, or Nengo BuiltConnection
+        # A dict with 'weights' key is the richest result; anything is acceptable
+        if isinstance(conn_data, dict):
+            assert "weights" in conn_data
+        # else: BuiltConnection or None — both are valid
+
+    def test_ensemble_params_are_numpy(self):
+        """Values returned by sim.data[ens] should be numpy arrays."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(8, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            params = sim.data[ens]
+
+        for key, val in params.items():
+            assert isinstance(val, np.ndarray), (
+                f"sim.data[ens]['{key}'] should be np.ndarray, got {type(val)}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Gradient checking (original: test_check_gradients)
+# ---------------------------------------------------------------------------
+
+class TestCheckGradients:
+    def test_check_gradients_returns_true(self):
+        """check_gradients() should return True (no NaN/Inf detected)."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            result = sim.check_gradients(n_steps=1)
+        assert result is True
+
+    def test_check_gradients_no_warning_for_healthy_net(self):
+        """A healthy differentiable network should not produce gradient warnings."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            with pytest.warns(None) as rec:
+                sim.check_gradients(n_steps=1)
+        nan_warnings = [w for w in rec if "NaN" in str(w.message) or "Inf" in str(w.message)]
+        assert len(nan_warnings) == 0, "Unexpected NaN/Inf gradient warning"
+
+
+# ---------------------------------------------------------------------------
+# freeze_params (original: test_freeze_params)
+# ---------------------------------------------------------------------------
+
+class TestFreezeParams:
+    def test_freeze_params_does_not_crash(self):
+        """freeze_params() should run without error."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, minibatch_size=4, seed=0) as sim:
+            x = np.random.RandomState(7).uniform(-1, 1, (16, 1, 1)).astype(np.float32)
+            y = np.zeros((16, 1, 1), dtype=np.float32)
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=3)
+            sim.freeze_params()  # should not raise
+
+    def test_freeze_params_specific_objects(self):
+        """freeze_params(objects) should accept a list of nengo objects."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            conn = nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.freeze_params([ens, conn])  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# trange (original: test_trange / time utilities)
+# ---------------------------------------------------------------------------
+
+class TestTrange:
+    def test_trange_length(self):
+        """trange() length should match n_steps of the last run."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, dt=0.001, seed=0) as sim:
+            sim.run_steps(15)
+            t = sim.trange()
+        assert len(t) == 15
+
+    def test_trange_values(self):
+        """trange() values should be multiples of dt starting at dt."""
+        net, inp, out, p = _make_simple_net()
+        dt = 0.002
+        n = 5
+        with nengo_dl.Simulator(net, dt=dt, seed=0) as sim:
+            sim.run_steps(n)
+            t = sim.trange()
+        expected = np.arange(1, n + 1) * dt
+        np.testing.assert_allclose(t, expected, rtol=1e-6)
+
+    def test_trange_custom_dt(self):
+        """trange(dt=x) should use the provided dt."""
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, dt=0.001, seed=0) as sim:
+            sim.run_steps(4)
+            t = sim.trange(dt=0.01)  # override dt
+        np.testing.assert_allclose(t, np.arange(1, 5) * 0.01, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# get_nengo_params (original: test_get_nengo_params)
+# ---------------------------------------------------------------------------
+
+class TestGetNengoParams:
+    def test_returns_dict(self):
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            result = sim.get_nengo_params()
+        assert isinstance(result, dict)
+
+    def test_specific_object(self):
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            result = sim.get_nengo_params([ens])
+        assert ens in result or len(result) == 0  # might not have signal if not built
+
+
+# ---------------------------------------------------------------------------
+# Training convergence (original: test_train_ff)
+# ---------------------------------------------------------------------------
+
+class TestTrainingConvergence:
+    def test_linear_regression_converges(self):
+        """A network with trainable parameters should learn a simple mapping."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(20, 1, neuron_type=nengo.RectifiedLinear(), seed=0)
+            out = nengo.Node(size_in=1)
+            nengo.Connection(inp, ens, synapse=None)
+            nengo.Connection(ens, out, function=lambda x: x, synapse=None)
+            p = nengo.Probe(out, synapse=None)
+
+        n = 64
+        rng = np.random.RandomState(42)
+        x = rng.uniform(-1, 1, (n, 1, 1)).astype(np.float32)
+        y = np.zeros((n, 1, 1), dtype=np.float32)  # learn to output 0
+
+        with nengo_dl.Simulator(net, minibatch_size=16, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            h = sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=15)
+
+        losses = h["loss"]
+        assert losses[-1] < losses[0], (
+            f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+        )
+
+    def test_fit_with_validation_split(self):
+        """fit with validation_split should produce val_loss entries."""
+        net, inp, out, p = _make_simple_net()
+        n = 32
+        x = np.random.RandomState(0).uniform(-1, 1, (n, 1, 1)).astype(np.float32)
+        y = np.zeros((n, 1, 1), dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            h = sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=2,
+                        validation_split=0.25)
+
+        assert "val_loss" in h
+        assert len(h["val_loss"]) == 2
+        assert all(np.isfinite(v) for v in h["val_loss"])

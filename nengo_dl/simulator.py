@@ -98,8 +98,9 @@ class SimulationData:
         result = {}
         if "weights" in sigs:
             sig = sigs["weights"]
-            current = tg.signals.gather(sig)
-            result["weights"] = current.detach().cpu().numpy()
+            if sig is not None:
+                current = tg.signals.gather(sig)
+                result["weights"] = current.detach().cpu().numpy()
         return result if result else model.params.get(conn)
 
     def _get_neuron_params(self, neurons):
@@ -238,7 +239,8 @@ class Simulator:
     # ------------------------------------------------------------------
 
     def run(self, time_in_seconds: float, data: Optional[Dict] = None,
-            progress_bar: Optional[bool] = None):
+            progress_bar: Optional[bool] = None,
+            inference_mode: str = "spiking"):
         """Run the simulation for a specified amount of time.
 
         Parameters
@@ -249,9 +251,17 @@ class Simulator:
             Input data. See ``run_steps``.
         progress_bar : bool, optional
             Show progress bar (overrides instance setting).
+        inference_mode : {"spiking", "rate"}, optional
+            If ``"spiking"``, spiking neurons emit discrete spikes. If
+            ``"rate"``, spiking neurons use their rate approximation.
         """
         n_steps = int(np.round(time_in_seconds / self.dt))
-        self.run_steps(n_steps, data=data, progress_bar=progress_bar)
+        self.run_steps(
+            n_steps,
+            data=data,
+            progress_bar=progress_bar,
+            inference_mode=inference_mode,
+        )
 
     def run_steps(
         self,
@@ -259,6 +269,7 @@ class Simulator:
         data: Optional[Dict] = None,
         progress_bar: Optional[bool] = None,
         stateful: bool = False,
+        inference_mode: str = "spiking",
     ):
         """Run the simulation for a fixed number of timesteps.
 
@@ -273,8 +284,12 @@ class Simulator:
             Overrides the instance-level ``progress_bar`` setting.
         stateful : bool, optional
             If True, preserve simulation state between calls.
+        inference_mode : {"spiking", "rate"}, optional
+            If ``"spiking"``, spiking neurons emit discrete spikes. If
+            ``"rate"``, spiking neurons use their rate approximation.
         """
         show_pbar = self.progress_bar if progress_bar is None else progress_bar
+        rate_mode = _inference_mode_to_rate(inference_mode)
 
         if not stateful:
             self.tensor_graph.reset_state()
@@ -284,6 +299,7 @@ class Simulator:
                 n_steps=n_steps,
                 input_data=data,
                 training=False,
+                rate_mode=rate_mode,
             )
 
         # Store probe data
@@ -300,6 +316,7 @@ class Simulator:
         n_steps: int = 1,
         stateful: bool = False,
         batch_size: Optional[int] = None,
+        inference_mode: str = "spiking",
     ) -> Dict[nengo.Probe, np.ndarray]:
         """Run inference and return probe data.
 
@@ -311,22 +328,35 @@ class Simulator:
             Number of timesteps.
         stateful : bool
             Preserve state between calls.
+        inference_mode : {"spiking", "rate"}
+            Inference mode for spiking neurons.
 
         Returns
         -------
         dict
             Maps probes to numpy arrays.
         """
-        self.run_steps(n_steps, data=x, stateful=stateful)
+        self.run_steps(
+            n_steps,
+            data=x,
+            stateful=stateful,
+            inference_mode=inference_mode,
+        )
         return {p: self.data[p] for p in self._model.probes}
 
     def predict_on_batch(
         self,
         x: Optional[Dict] = None,
         n_steps: int = 1,
+        inference_mode: str = "spiking",
     ) -> Dict[nengo.Probe, np.ndarray]:
         """Run inference on a single batch."""
-        return self.predict(x=x, n_steps=n_steps, stateful=False)
+        return self.predict(
+            x=x,
+            n_steps=n_steps,
+            stateful=False,
+            inference_mode=inference_mode,
+        )
 
     # ------------------------------------------------------------------
     # Training
@@ -542,10 +572,18 @@ class Simulator:
 
         return total
 
-    def _compute_val_loss(self, val_x, val_y, n_steps, bs):
+    def _compute_val_loss(
+        self,
+        val_x,
+        val_y,
+        n_steps,
+        bs,
+        inference_mode: str = "spiking",
+    ):
         """Compute validation loss without gradients."""
         losses = []
         n_val = _count_samples(val_x, val_y)
+        rate_mode = _inference_mode_to_rate(inference_mode)
         with torch.no_grad():
             for start in range(0, n_val, bs):
                 end = min(start + bs, n_val)
@@ -553,7 +591,12 @@ class Simulator:
                 batch_x = _index_data(val_x, idx)
                 batch_y = _index_data(val_y, idx)
                 self.tensor_graph.reset_state()
-                results = self.tensor_graph.forward(n_steps, batch_x, training=False)
+                results = self.tensor_graph.forward(
+                    n_steps,
+                    batch_x,
+                    training=False,
+                    rate_mode=rate_mode,
+                )
                 loss = self._compute_loss(results, batch_y, len(idx))
                 if loss is not None:
                     losses.append(loss.item())
@@ -565,6 +608,7 @@ class Simulator:
         y: Optional[Dict] = None,
         n_steps: int = 1,
         batch_size: Optional[int] = None,
+        inference_mode: str = "spiking",
     ) -> Dict:
         """Evaluate the model on test data.
 
@@ -574,7 +618,13 @@ class Simulator:
             ``{'loss': float}``
         """
         bs = batch_size if batch_size is not None else self.minibatch_size
-        val_loss = self._compute_val_loss(x, y, n_steps, bs)
+        val_loss = self._compute_val_loss(
+            x,
+            y,
+            n_steps,
+            bs,
+            inference_mode=inference_mode,
+        )
         return {"loss": val_loss}
 
     # ------------------------------------------------------------------
@@ -810,6 +860,22 @@ class Simulator:
 # ---------------------------------------------------------------------------
 # Helper functions for data management
 # ---------------------------------------------------------------------------
+
+def _inference_mode_to_rate(inference_mode):
+    """Return whether a public inference mode should use rate neurons."""
+    if isinstance(inference_mode, bool):
+        return inference_mode
+
+    mode = str(inference_mode).lower().replace("_", "-")
+    if mode in {"spiking", "spike", "spikes"}:
+        return False
+    if mode in {"rate", "rates", "rate-based", "ratebased"}:
+        return True
+
+    raise ValueError(
+        "inference_mode must be 'spiking' or 'rate', "
+        f"got {inference_mode!r}"
+    )
 
 def _count_samples(x, y):
     """Count number of samples from input/target dicts."""

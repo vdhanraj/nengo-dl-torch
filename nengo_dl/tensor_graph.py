@@ -138,6 +138,8 @@ class TensorGraph(nn.Module):
         LIF surrogate smoothing parameter (0 = pure spiking, >0 = smooth).
     inference_only : bool, optional
         If True, skip training-specific ops.
+    rate_mode : bool, optional
+        If True, use rate approximations for spiking neurons during inference.
     trainable : bool, optional
         Whether readonly signals are treated as trainable parameters.
     """
@@ -197,6 +199,7 @@ class TensorGraph(nn.Module):
             dt=dt,
             minibatch_size=minibatch_size,
             training=False,  # will be overridden per-call
+            rate_mode=False,  # will be overridden per-call
             lif_smoothing=lif_smoothing,
             inference_only=inference_only,
             device=device,
@@ -266,6 +269,7 @@ class TensorGraph(nn.Module):
         n_steps: int,
         input_data: Optional[Dict] = None,
         training: bool = False,
+        rate_mode: bool = False,
     ) -> Dict:
         """Run the simulation for *n_steps* timesteps.
 
@@ -278,6 +282,9 @@ class TensorGraph(nn.Module):
             ``(batch, n_steps, node_size)`` or ``(n_steps, node_size)``.
         training : bool, optional
             If True, use training-mode neuron dynamics (e.g. rate approx).
+        rate_mode : bool, optional
+            If True, use rate approximations for spiking neurons without
+            enabling gradient/training behavior.
 
         Returns
         -------
@@ -293,6 +300,7 @@ class TensorGraph(nn.Module):
 
         # Update config training flag
         self._config.training = training
+        self._config.rate_mode = rate_mode
 
         # Pre-process input data
         processed_inputs: Dict[Signal, torch.Tensor] = {}
@@ -342,10 +350,18 @@ class TensorGraph(nn.Module):
 
     def get_weights(self) -> Dict[str, np.ndarray]:
         """Return all trainable parameters as a dict of numpy arrays."""
-        return {
+        weights = {
             name: param.data.cpu().numpy()
             for name, param in self._param_dict.items()
         }
+
+        for idx, module in enumerate(self._torch_modules):
+            prefix = f"torch_module_{idx:04d}."
+            for name, tensor in module.state_dict().items():
+                if torch.is_tensor(tensor):
+                    weights[prefix + name] = tensor.detach().cpu().numpy()
+
+        return weights
 
     def set_weights(self, weights: Dict[str, np.ndarray]):
         """Set trainable parameters from a dict of numpy arrays."""
@@ -355,6 +371,24 @@ class TensorGraph(nn.Module):
                     self._param_dict[name].copy_(
                         torch.tensor(val, dtype=self.dtype, device=self.device)
                     )
+
+        for idx, module in enumerate(self._torch_modules):
+            prefix = f"torch_module_{idx:04d}."
+            state = module.state_dict()
+            changed = False
+
+            for name, current in state.items():
+                key = prefix + name
+                if key in weights:
+                    state[name] = torch.as_tensor(
+                        weights[key],
+                        dtype=current.dtype,
+                        device=current.device,
+                    )
+                    changed = True
+
+            if changed:
+                module.load_state_dict(state, strict=False)
 
     def extra_repr(self) -> str:
         return (

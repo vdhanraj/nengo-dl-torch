@@ -173,3 +173,109 @@ def test_conversion_error_is_exception():
     err = ConversionError("test error")
     assert isinstance(err, Exception)
     assert "test error" in str(err)
+
+
+# ---------------------------------------------------------------------------
+# Numerical verification (original: test_verify_* from test_converter.py)
+# ---------------------------------------------------------------------------
+
+class TestConverterNumerical:
+    """Verify that the converted network produces outputs consistent with the
+    original PyTorch model (at least structurally, since rate vs spiking
+    neurons differ in dynamics).
+    """
+
+    def test_output_shape_matches_pytorch(self):
+        """The Nengo network output shape must match the PyTorch model output."""
+        in_size, out_size = 4, 3
+        model = nn.Sequential(nn.Linear(in_size, 8), nn.ReLU(), nn.Linear(8, out_size))
+        model.eval()
+
+        c = Converter(model, scale_firing_rates=100.0)
+        inp_node = list(c.inputs.values())[0]
+        out_node = list(c.outputs.values())[-1]
+
+        with c.net:
+            p = nengo.Probe(out_node, synapse=None)
+
+        x = np.random.RandomState(0).randn(1, 1, in_size).astype(np.float32)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp_node: x})
+            nengo_out = sim.data[p]
+
+        # Shape: (n_steps=1, out_size=3)
+        assert nengo_out.shape == (1, out_size), (
+            f"Expected shape (1, {out_size}), got {nengo_out.shape}"
+        )
+
+    def test_no_nan_in_output(self):
+        """Converted network must not produce NaN outputs."""
+        model = _make_mlp(in_size=4, hidden=8, out_size=3)
+        c = Converter(model, scale_firing_rates=100.0)
+        inp_node = list(c.inputs.values())[0]
+        out_node = list(c.outputs.values())[-1]
+
+        with c.net:
+            p = nengo.Probe(out_node, synapse=None)
+
+        x = np.random.RandomState(1).randn(1, 5, 4).astype(np.float32)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(5, data={inp_node: x})
+            out = sim.data[p]
+
+        assert not np.any(np.isnan(out)), "Converted network produced NaN output"
+        assert not np.any(np.isinf(out)), "Converted network produced Inf output"
+
+    def test_linear_only_network_positive_outputs(self):
+        """Converted network with positive-definite input must match PyTorch+ReLU.
+
+        The converter always uses RectifiedLinear neurons, so the Nengo output
+        equals relu(W*x + b) even when the original model has no activation.
+        We verify with inputs that produce positive linear outputs.
+        """
+        torch.manual_seed(42)
+        model = nn.Linear(4, 3, bias=True)
+        # Force weights / bias to be all-positive so relu is a no-op
+        with torch.no_grad():
+            model.weight.data.abs_()
+            model.bias.data.abs_()
+        model.eval()
+
+        x_np = np.abs(np.random.RandomState(0).randn(4).astype(np.float32))
+
+        with torch.no_grad():
+            pytorch_out = model(torch.tensor(x_np)).numpy()
+
+        c = Converter(model, activation_type="rectified_linear", synapse=None)
+        inp_node = list(c.inputs.values())[0]
+        out_node = list(c.outputs.values())[-1]
+
+        with c.net:
+            p = nengo.Probe(out_node, synapse=None)
+
+        x_batch = x_np.reshape(1, 1, 4)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp_node: x_batch})
+            nengo_out = sim.data[p][0]  # first (and only) timestep
+
+        # With positive outputs, ReLU does not clip, so Nengo ≈ PyTorch
+        np.testing.assert_allclose(
+            nengo_out, pytorch_out, rtol=1e-4, atol=1e-4,
+            err_msg="Converted linear network output mismatch for positive inputs"
+        )
+
+    def test_synapse_applied_to_connections(self):
+        """Converter with synapse!=None should create connections with that synapse."""
+        tau = 0.005
+        model = _make_mlp(in_size=4, hidden=8, out_size=3)
+        c = Converter(model, synapse=tau)
+
+        synapse_taus = []
+        for conn in c.net.all_connections:
+            if conn.synapse is not None:
+                synapse_taus.append(getattr(conn.synapse, "tau", None))
+
+        # At least some connections should carry the synapse
+        assert any(t == tau for t in synapse_taus), (
+            f"No connection found with synapse tau={tau}; found: {synapse_taus}"
+        )

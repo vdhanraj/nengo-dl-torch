@@ -20,6 +20,9 @@ class BuildConfig:
         Number of samples per minibatch.
     training : bool
         Whether the network is in training mode.
+    rate_mode : bool
+        Whether spiking neuron builders should use rate approximations during
+        inference. Training also uses rate approximations.
     lif_smoothing : float
         Smoothing for LIF surrogate gradients. 0 = pure spiking,
         positive values give smoother rate approximations.
@@ -36,6 +39,7 @@ class BuildConfig:
     dt: float = 0.001
     minibatch_size: int = 1
     training: bool = False
+    rate_mode: bool = False
     lif_smoothing: float = 0.0
     inference_only: bool = False
     device: Any = None

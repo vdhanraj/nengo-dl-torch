@@ -248,9 +248,14 @@ class SimTorchNodeBuilder(OpBuilder):
             x_sig = op_info["input_sig"]
             out_sig = op_info["output_sig"]
 
-            # Use smooth LIF module during training if lif_smoothing is set
+            # Use smooth LIF module during training or rate-mode inference if
+            # lif_smoothing is set.
             smooth = op_info["smooth_module"]
-            if config.training and config.lif_smoothing > 0 and smooth is not None:
+            if (
+                (config.training or config.rate_mode)
+                and config.lif_smoothing > 0
+                and smooth is not None
+            ):
                 module = smooth
             else:
                 module = op_info["module"]

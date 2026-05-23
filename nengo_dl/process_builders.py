@@ -74,15 +74,17 @@ class SimProcessBuilder(OpBuilder):
         shape_in = op.input.shape if op.input is not None else (0,)
         shape_out = op.output.shape
 
-        # We use a single numpy state dict shared across batch items
         rng = config.rng if config.rng is not None else np.random.default_rng(0)
 
-        # Build per-batch step functions
         fns = []
         for _ in range(config.minibatch_size):
-            # Each batch item gets its own state (seeded differently)
-            state = op.process.make_step(shape_in, shape_out, dt, rng, {})
-            fns.append(state)
+            # Nengo 4.x: make_state is separate; build it first, then make_step
+            if hasattr(process, "make_state"):
+                state = process.make_state(shape_in, shape_out, dt)
+            else:
+                state = {}
+            step_fn = process.make_step(shape_in, shape_out, dt, rng, state)
+            fns.append(step_fn)
 
         return {
             "type": "numpy",

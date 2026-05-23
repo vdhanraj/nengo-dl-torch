@@ -161,7 +161,7 @@ def _lif_step(op, state_sigs, signals, config):
     V = V.to(config.dtype)
     R = R.to(config.dtype)
 
-    if config.training:
+    if config.training or config.rate_mode:
         # During training, swap spiking → SoftLIF rate neurons (matches original NengoDL
         # behavior: "spiking neurons are automatically being swapped for differentiable
         # rate neurons"). SoftLIF avoids the infinite gradient of hard rate LIF near
@@ -262,7 +262,7 @@ def _spiking_relu_step(op, state_sigs, signals, config):
     J = signals.gather(op.J).to(config.dtype)
     V = signals.gather(state_sigs["voltage"]).to(config.dtype)
 
-    if config.training:
+    if config.training or config.rate_mode:
         # Use rate approximation for training
         output = F.relu(J) * neurons.amplitude
         signals.scatter(op.output, output, mode="set")
@@ -335,7 +335,7 @@ def _adaptive_lif_step(op, state_sigs, signals, config):
     inc_n = neurons.inc_n
     amplitude = neurons.amplitude
 
-    if config.training:
+    if config.training or config.rate_mode:
         J_eff = J - A
         sigma = config.lif_smoothing if config.lif_smoothing > 0 else 0.002
         output = _soft_lif_rate(J_eff, tau_rc, tau_ref, amplitude, sigma)
@@ -405,7 +405,7 @@ def _spiking_leaky_relu_step(op, state_sigs, signals, config):
     J = signals.gather(op.J).to(config.dtype)
     V = signals.gather(state_sigs["voltage"]).to(config.dtype)
 
-    if config.training:
+    if config.training or config.rate_mode:
         J_eff = torch.where(J >= 0, J, J * neurons.negative_slope)
         output = J_eff * neurons.amplitude
         signals.scatter(op.output, output, mode="set")
