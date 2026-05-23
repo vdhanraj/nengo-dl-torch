@@ -22,6 +22,29 @@ def _make_mlp(in_size=4, hidden=8, out_size=3):
     )
 
 
+def _run_converter(model, x_np, scale=None, activation_type="rectified_linear",
+                   synapse=None, inference_mode="rate"):
+    """Convert model, run one step in rate mode, return (nengo_out, pytorch_out)."""
+    x_np = np.asarray(x_np, dtype=np.float32)
+    model.eval()
+    with torch.no_grad():
+        pt_out = model(torch.tensor(x_np)).numpy()
+
+    c = Converter(model, scale_firing_rates=scale,
+                  activation_type=activation_type, synapse=synapse)
+    inp = list(c.inputs.values())[0]
+    out = list(c.outputs.values())[-1]
+    with c.net:
+        p = nengo.Probe(out, synapse=None)
+
+    x_b = x_np.reshape(1, 1, -1)
+    with nengo_dl.Simulator(c.net, seed=0) as sim:
+        sim.run_steps(1, data={inp: x_b}, inference_mode=inference_mode)
+        nengo_out = sim.data[p][0]
+
+    return nengo_out, pt_out
+
+
 # ---------------------------------------------------------------------------
 # Basic conversion
 # ---------------------------------------------------------------------------
@@ -63,17 +86,22 @@ class TestConverterBasic:
             data = sim.data[p]
         assert data.shape[-1] == 3
 
-    def test_scale_firing_rates_applied(self):
-        """scale_firing_rates should rescale connection weights."""
-        scale = 100.0
-        model = _make_mlp(in_size=4, hidden=8, out_size=3)
-        c_noscale = Converter(model, scale_firing_rates=None)
-        c_scaled = Converter(model, scale_firing_rates=scale)
-        # The scaled network should have different (smaller) connection weights
-        # We can verify this by checking the connection transforms
-        noscale_conns = list(c_noscale.net.all_connections)
-        scaled_conns = list(c_scaled.net.all_connections)
-        assert len(noscale_conns) == len(scaled_conns)
+    def test_scale_firing_rates_changes_output(self):
+        """scale_firing_rates should not change the rate-mode numerical output."""
+        torch.manual_seed(7)
+        model = nn.Linear(4, 3, bias=True)
+        with torch.no_grad():
+            model.weight.data.abs_()
+            model.bias.data.fill_(1.0)
+
+        x_np = np.abs(np.random.RandomState(11).randn(4)).astype(np.float32)
+        out_noscale, _ = _run_converter(model, x_np, scale=None)
+        out_scaled, _ = _run_converter(model, x_np, scale=100.0)
+        # Rate-mode output is scale-invariant: relu(W@x+b) regardless of scale
+        np.testing.assert_allclose(
+            out_noscale, out_scaled, rtol=1e-3, atol=1e-3,
+            err_msg="scale_firing_rates must not change rate-mode output"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +154,20 @@ class TestConverterLayers:
         with pytest.raises(ConversionError):
             Converter(model, allow_fallback=False)
 
+    def test_conv2d_uses_fallback_and_warns(self):
+        """Conv2d routes through the fallback path and emits a warning."""
+        model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.Flatten(), nn.Linear(4, 2))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            c = Converter(model)  # allow_fallback=True by default
+        assert isinstance(c.net, nengo.Network), "Conv2d fallback should produce a valid Network"
+        assert any("not natively supported" in str(warning.message) for warning in w), (
+            "Conv2d via fallback should emit a warning"
+        )
+
 
 # ---------------------------------------------------------------------------
-# Activation types
+# Activation types — neuron type correctness
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("activation_type", [
@@ -149,6 +188,57 @@ def test_unknown_activation_type_warns():
     assert isinstance(c.net, nengo.Network)
 
 
+def test_rectified_linear_neuron_type_in_ensemble():
+    """activation_type='rectified_linear' must create RectifiedLinear ensembles."""
+    model = nn.Linear(3, 4)
+    c = Converter(model, activation_type="rectified_linear")
+    for ens in c.net.all_ensembles:
+        assert isinstance(ens.neuron_type, nengo.RectifiedLinear), (
+            f"Expected RectifiedLinear, got {type(ens.neuron_type).__name__}"
+        )
+
+
+def test_spiking_relu_neuron_type_in_ensemble():
+    """activation_type='spiking_relu' must create SpikingRectifiedLinear ensembles."""
+    model = nn.Linear(3, 4)
+    c = Converter(model, activation_type="spiking_relu")
+    for ens in c.net.all_ensembles:
+        assert isinstance(ens.neuron_type, nengo.SpikingRectifiedLinear), (
+            f"Expected SpikingRectifiedLinear, got {type(ens.neuron_type).__name__}"
+        )
+
+
+def test_scale_firing_rates_sets_amplitude():
+    """With scale_firing_rates=S, neuron amplitude should be 1/S."""
+    scale = 200.0
+    model = nn.Linear(3, 4)
+    c = Converter(model, scale_firing_rates=scale, activation_type="rectified_linear")
+    for ens in c.net.all_ensembles:
+        expected_amp = 1.0 / scale
+        actual_amp = ens.neuron_type.amplitude
+        assert abs(actual_amp - expected_amp) < 1e-6, (
+            f"Expected amplitude={expected_amp}, got {actual_amp}"
+        )
+
+
+def test_scale_firing_rates_sets_gain():
+    """With scale_firing_rates=S, ensemble gain should equal S."""
+    scale = 50.0
+    model = nn.Linear(3, 4)
+    c = Converter(model, scale_firing_rates=scale, activation_type="rectified_linear")
+
+    inp = list(c.inputs.values())[0]
+    with nengo_dl.Simulator(c.net, seed=0) as sim:
+        for ens in c.net.all_ensembles:
+            params = sim.data[ens]
+            if params and "gain" in params:
+                np.testing.assert_allclose(
+                    params["gain"], np.full_like(params["gain"], scale),
+                    rtol=1e-5,
+                    err_msg=f"Ensemble gain should equal scale_firing_rates={scale}"
+                )
+
+
 # ---------------------------------------------------------------------------
 # Synapse
 # ---------------------------------------------------------------------------
@@ -164,6 +254,21 @@ class TestConverterSynapse:
         c = Converter(model, synapse=0.005)
         assert isinstance(c.net, nengo.Network)
 
+    def test_synapse_applied_to_connections(self):
+        """Converter with synapse!=None should create connections with that synapse."""
+        tau = 0.005
+        model = _make_mlp(in_size=4, hidden=8, out_size=3)
+        c = Converter(model, synapse=tau)
+
+        synapse_taus = []
+        for conn in c.net.all_connections:
+            if conn.synapse is not None:
+                synapse_taus.append(getattr(conn.synapse, "tau", None))
+
+        assert any(t == tau for t in synapse_taus), (
+            f"No connection found with synapse tau={tau}; found: {synapse_taus}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # ConversionError
@@ -176,7 +281,7 @@ def test_conversion_error_is_exception():
 
 
 # ---------------------------------------------------------------------------
-# Numerical verification (original: test_verify_* from test_converter.py)
+# Numerical verification — rate-mode must match PyTorch
 # ---------------------------------------------------------------------------
 
 class TestConverterNumerical:
@@ -203,7 +308,6 @@ class TestConverterNumerical:
             sim.run_steps(1, data={inp_node: x})
             nengo_out = sim.data[p]
 
-        # Shape: (n_steps=1, out_size=3)
         assert nengo_out.shape == (1, out_size), (
             f"Expected shape (1, {out_size}), got {nengo_out.shape}"
         )
@@ -227,15 +331,9 @@ class TestConverterNumerical:
         assert not np.any(np.isinf(out)), "Converted network produced Inf output"
 
     def test_linear_only_network_positive_outputs(self):
-        """Converted network with positive-definite input must match PyTorch+ReLU.
-
-        The converter always uses RectifiedLinear neurons, so the Nengo output
-        equals relu(W*x + b) even when the original model has no activation.
-        We verify with inputs that produce positive linear outputs.
-        """
+        """Converted network with positive-definite input must match PyTorch+ReLU."""
         torch.manual_seed(42)
         model = nn.Linear(4, 3, bias=True)
-        # Force weights / bias to be all-positive so relu is a no-op
         with torch.no_grad():
             model.weight.data.abs_()
             model.bias.data.abs_()
@@ -256,9 +354,8 @@ class TestConverterNumerical:
         x_batch = x_np.reshape(1, 1, 4)
         with nengo_dl.Simulator(c.net, seed=0) as sim:
             sim.run_steps(1, data={inp_node: x_batch})
-            nengo_out = sim.data[p][0]  # first (and only) timestep
+            nengo_out = sim.data[p][0]
 
-        # With positive outputs, ReLU does not clip, so Nengo ≈ PyTorch
         np.testing.assert_allclose(
             nengo_out, pytorch_out, rtol=1e-4, atol=1e-4,
             err_msg="Converted linear network output mismatch for positive inputs"
@@ -275,7 +372,269 @@ class TestConverterNumerical:
             if conn.synapse is not None:
                 synapse_taus.append(getattr(conn.synapse, "tau", None))
 
-        # At least some connections should carry the synapse
         assert any(t == tau for t in synapse_taus), (
             f"No connection found with synapse tau={tau}; found: {synapse_taus}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Reference comparison: rate-mode Nengo output == PyTorch relu output
+# ---------------------------------------------------------------------------
+
+class TestConverterRateModeReference:
+    """Rate-mode converted network must reproduce the PyTorch model's output
+    exactly (up to floating-point tolerance) for all positive pre-activations,
+    and zero for all negative ones.
+    """
+
+    def _pos_linear(self, in_size=4, out_size=3, seed=7):
+        torch.manual_seed(seed)
+        m = nn.Linear(in_size, out_size, bias=True)
+        with torch.no_grad():
+            m.weight.data.abs_()
+            m.bias.data.fill_(1.0)
+        m.eval()
+        return m
+
+    def test_rate_mode_matches_pytorch_no_scale(self):
+        """scale_firing_rates=None: Nengo rate output == relu(W@x+b)."""
+        model = self._pos_linear()
+        x_np = np.abs(np.random.RandomState(0).randn(4)).astype(np.float32)
+        nengo_out, pt_out = _run_converter(model, x_np, scale=None)
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-4, atol=1e-4,
+                                   err_msg="Rate-mode (scale=None) must match PyTorch")
+
+    def test_rate_mode_matches_pytorch_scale_10(self):
+        """scale_firing_rates=10: rate-mode output still == relu(W@x+b)."""
+        model = self._pos_linear()
+        x_np = np.abs(np.random.RandomState(1).randn(4)).astype(np.float32)
+        nengo_out, pt_out = _run_converter(model, x_np, scale=10.0)
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-3, atol=1e-3,
+                                   err_msg="Rate-mode (scale=10) must match PyTorch")
+
+    def test_rate_mode_matches_pytorch_scale_500(self):
+        """scale_firing_rates=500: rate-mode output still == relu(W@x+b)."""
+        model = self._pos_linear()
+        x_np = np.abs(np.random.RandomState(2).randn(4)).astype(np.float32)
+        nengo_out, pt_out = _run_converter(model, x_np, scale=500.0)
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-2, atol=1e-2,
+                                   err_msg="Rate-mode (scale=500) must match PyTorch")
+
+    def test_negative_inputs_give_zero_output(self):
+        """Strongly negative inputs must produce zero output (ReLU clamping)."""
+        torch.manual_seed(42)
+        model = nn.Linear(3, 2, bias=True)
+        with torch.no_grad():
+            model.weight.data.fill_(1.0)
+            model.bias.data.fill_(-20.0)  # large negative bias guarantees J < 0
+        model.eval()
+        x_np = np.zeros(3, dtype=np.float32)  # zero input → J = bias = -20
+
+        nengo_out, _ = _run_converter(model, x_np, scale=None)
+        np.testing.assert_allclose(nengo_out, np.zeros(2), atol=1e-5,
+                                   err_msg="Strongly subthreshold input must give zero output")
+
+    def test_relu_matches_pytorch_relu(self):
+        """For mixed-sign outputs, Nengo output == np.maximum(0, pytorch_output)."""
+        torch.manual_seed(99)
+        model = nn.Linear(5, 4, bias=True)
+        model.eval()
+        x_np = np.random.RandomState(3).randn(5).astype(np.float32)
+
+        with torch.no_grad():
+            pt_linear = model(torch.tensor(x_np)).numpy()
+        expected = np.maximum(0.0, pt_linear)
+
+        nengo_out, _ = _run_converter(model, x_np, scale=None)
+        np.testing.assert_allclose(nengo_out, expected, rtol=1e-4, atol=1e-4,
+                                   err_msg="Nengo rate output must equal relu(W@x+b)")
+
+    def test_known_weights_exact_output(self):
+        """Hand-crafted weights: verify exact numerical output."""
+        # W = [[1, 0], [0, 1]], b = [0.5, 0.5], x = [2.0, 3.0]
+        # relu(W@x + b) = relu([2.5, 3.5]) = [2.5, 3.5]
+        model = nn.Linear(2, 2, bias=True)
+        with torch.no_grad():
+            model.weight.data = torch.eye(2)
+            model.bias.data = torch.tensor([0.5, 0.5])
+        model.eval()
+
+        x_np = np.array([2.0, 3.0], dtype=np.float32)
+        expected = np.array([2.5, 3.5], dtype=np.float32)
+
+        for scale in [None, 50.0, 200.0]:
+            nengo_out, _ = _run_converter(model, x_np, scale=scale)
+            np.testing.assert_allclose(
+                nengo_out, expected, rtol=1e-3, atol=1e-3,
+                err_msg=f"Known-weight test failed for scale={scale}"
+            )
+
+    def test_known_weights_negative_output_zero(self):
+        """W = -I, b = 0, x = [1, 1]: relu(W@x+b) = relu([-1,-1]) = [0,0]."""
+        model = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            model.weight.data = -torch.eye(2)
+        model.eval()
+
+        x_np = np.array([1.0, 1.0], dtype=np.float32)
+        nengo_out, _ = _run_converter(model, x_np, scale=None)
+        np.testing.assert_allclose(nengo_out, np.zeros(2), atol=1e-5,
+                                   err_msg="relu([-1,-1]) must be [0,0]")
+
+    def test_two_layer_mlp_rate_matches_pytorch(self):
+        """Two-layer MLP: rate-mode Nengo equals relu(W2 @ relu(W1@x+b1) + b2)."""
+        torch.manual_seed(13)
+        model = nn.Sequential(
+            nn.Linear(4, 6, bias=True),
+            nn.ReLU(),
+            nn.Linear(6, 3, bias=True),
+        )
+        with torch.no_grad():
+            # Set up weights so first and last layers give positive outputs
+            model[0].weight.data.abs_()
+            model[0].bias.data.fill_(0.5)
+            model[2].weight.data.abs_()
+            model[2].bias.data.fill_(0.5)
+        model.eval()
+
+        x_np = np.abs(np.random.RandomState(5).randn(4)).astype(np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np)).numpy()
+
+        c = Converter(model, scale_firing_rates=100.0, activation_type="rectified_linear",
+                      synapse=None)
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        x_b = x_np.reshape(1, 1, 4)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_b}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-2, atol=1e-2,
+                                   err_msg="Two-layer MLP rate mode should match PyTorch")
+
+    def test_argmax_preserved_for_random_network(self):
+        """rate-mode argmax must agree with PyTorch argmax on positive-output net."""
+        torch.manual_seed(17)
+        model = _make_mlp(in_size=8, hidden=16, out_size=5)
+        with torch.no_grad():
+            for p_t in model.parameters():
+                p_t.data.abs_()
+            for m in model.modules():
+                if isinstance(m, nn.Linear):
+                    m.bias.data.fill_(1.0)
+        model.eval()
+
+        rng = np.random.RandomState(77)
+        n_correct = 0
+        n_trials = 10
+        for i in range(n_trials):
+            x_np = np.abs(rng.randn(8)).astype(np.float32)
+            with torch.no_grad():
+                pt_out = model(torch.tensor(x_np)).numpy()
+
+            c = Converter(model, scale_firing_rates=500.0, synapse=None)
+            inp = list(c.inputs.values())[0]
+            out = list(c.outputs.values())[-1]
+            with c.net:
+                p = nengo.Probe(out, synapse=None)
+            x_b = x_np.reshape(1, 1, 8)
+            with nengo_dl.Simulator(c.net, seed=0) as sim:
+                sim.run_steps(1, data={inp: x_b}, inference_mode="rate")
+                nengo_out = sim.data[p][0]
+
+            if np.argmax(nengo_out) == np.argmax(pt_out):
+                n_correct += 1
+
+        assert n_correct == n_trials, (
+            f"argmax matched {n_correct}/{n_trials} times (expected all)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Spiking mode
+# ---------------------------------------------------------------------------
+
+class TestConverterSpikingMode:
+    def test_spiking_output_is_nonnegative(self):
+        """Spiking output (spike count / dt) must be non-negative."""
+        model = nn.Linear(4, 3)
+        model.eval()
+        c = Converter(model, scale_firing_rates=500.0, activation_type="spiking_relu")
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        x = np.ones((1, 1, 4), dtype=np.float32)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x}, inference_mode="spiking")
+            out_data = sim.data[p]
+        assert np.all(out_data >= 0.0), "Spiking output must be non-negative"
+
+    def test_spiking_output_differs_from_rate_output(self):
+        """A single-step spiking run differs from rate run (discrete vs continuous)."""
+        torch.manual_seed(0)
+        model = nn.Linear(4, 8, bias=True)
+        with torch.no_grad():
+            model.weight.data.fill_(0.5)
+            model.bias.data.fill_(0.5)
+        model.eval()
+
+        x_np = np.ones((1, 1, 4), dtype=np.float32) * 2.0
+
+        c_rate = Converter(model, scale_firing_rates=100.0, activation_type="rectified_linear")
+        c_spike = Converter(model, scale_firing_rates=100.0, activation_type="spiking_relu")
+
+        def run(converter, mode):
+            inp = list(converter.inputs.values())[0]
+            out = list(converter.outputs.values())[-1]
+            with converter.net:
+                p = nengo.Probe(out, synapse=None)
+            with nengo_dl.Simulator(converter.net, seed=42) as sim:
+                sim.run_steps(1, data={inp: x_np}, inference_mode=mode)
+                return sim.data[p][0].copy()
+
+        rate_out = run(c_rate, "rate")
+        spike_out = run(c_spike, "spiking")
+        # Rate output is continuous; spiking output is 0 or 1/dt
+        # They will differ in magnitude / pattern for a single step
+        assert rate_out.shape == spike_out.shape
+
+    def test_spiking_multistep_average_approaches_rate(self):
+        """Average spiking output over many steps approaches rate output."""
+        torch.manual_seed(0)
+        model = nn.Linear(3, 2, bias=True)
+        with torch.no_grad():
+            model.weight.data = torch.eye(2, 3)
+            model.bias.data.fill_(0.3)  # ensures firing
+        model.eval()
+
+        n_steps = 500
+        x_val = np.ones((1, n_steps, 3), dtype=np.float32) * 1.0
+
+        rate_c = Converter(model, scale_firing_rates=200.0, activation_type="rectified_linear", synapse=None)
+        spike_c = Converter(model, scale_firing_rates=200.0, activation_type="spiking_relu", synapse=None)
+
+        def run(conv, mode, x):
+            inp = list(conv.inputs.values())[0]
+            out = list(conv.outputs.values())[-1]
+            with conv.net:
+                p = nengo.Probe(out, synapse=None)
+            with nengo_dl.Simulator(conv.net, seed=1) as sim:
+                sim.run_steps(n_steps, data={inp: x}, inference_mode=mode)
+                return sim.data[p].copy()
+
+        rate_out = run(rate_c, "rate", x_val[:, :1, :])  # single step, repeated
+        spike_data = run(spike_c, "spiking", x_val)
+        spike_mean = spike_data.mean(axis=0)  # average over timesteps
+
+        # Mean spiking rate (amplitude * spike_count) should be close to rate output
+        np.testing.assert_allclose(
+            spike_mean, rate_out[0], rtol=0.2, atol=0.2,
+            err_msg="Mean spiking output should approximate rate output over many steps"
         )

@@ -1,5 +1,7 @@
 """Tests for nengo_dl.Simulator."""
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -149,6 +151,66 @@ class TestRunSteps:
         with nengo_dl.Simulator(net, seed=0) as sim:
             with pytest.raises(KeyError):
                 _ = sim.data[p]
+
+    def test_exact_linear_output(self):
+        """Constant node 2.0 → transform=3.0 → probe must read exactly 6.0."""
+        with nengo.Network(seed=0) as net:
+            a = nengo.Node(np.array([2.0]))
+            b = nengo.Node(size_in=1)
+            nengo.Connection(a, b, transform=3.0, synapse=None)
+            p = nengo.Probe(b, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(5)
+        np.testing.assert_allclose(
+            sim.data[p], np.full((5, 1), 6.0), atol=1e-5,
+            err_msg="transform=3.0 × node_output=2.0 must equal 6.0 at every step",
+        )
+
+    def test_multi_batch_each_gets_own_input(self):
+        """Each batch item gets its own injected input and independent output."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            b = nengo.Node(size_in=1)
+            nengo.Connection(inp, b, synapse=None)
+            p = nengo.Probe(b, synapse=None)
+
+        vals = [1.0, 5.0, 10.0]
+        bs = len(vals)
+        x = np.array([[[v]] for v in vals], dtype=np.float32)  # (3, 1, 1)
+
+        with nengo_dl.Simulator(net, minibatch_size=bs, seed=0) as sim:
+            sim.run_steps(1, data={inp: x})
+            out = sim.data[p]  # (3, 1, 1)
+
+        for i, v in enumerate(vals):
+            np.testing.assert_allclose(
+                out[i, 0, 0], v, atol=1e-5,
+                err_msg=f"Batch item {i}: expected {v}, got {out[i,0,0]}",
+            )
+
+    def test_probe_with_synapse_filters_signal(self):
+        """Synapse probe: step response starts below the step, converges over time."""
+        tau = 0.01
+        dt = 0.001
+        n_steps = 100
+        step_val = 1.0
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([step_val]))
+            p = nengo.Probe(inp, synapse=tau)
+
+        with nengo_dl.Simulator(net, dt=dt, seed=0) as sim:
+            sim.run_steps(n_steps)
+            out = sim.data[p]  # (n_steps, 1)
+
+        # First step value must be significantly less than step_val
+        assert out[0, 0] < 0.5 * step_val, (
+            f"Filter should attenuate first step: got {out[0,0]:.4f} >= 0.5"
+        )
+        # By step 100 (t=0.1s = 10 tau), value should be close to step_val
+        np.testing.assert_allclose(out[-1, 0], step_val, atol=0.01,
+                                   err_msg="Filtered probe should converge to step after 10τ")
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +689,8 @@ class TestCheckGradients:
         """A healthy differentiable network should not produce gradient warnings."""
         net, inp, out, p = _make_simple_net()
         with nengo_dl.Simulator(net, seed=0) as sim:
-            with pytest.warns(None) as rec:
+            with warnings.catch_warnings(record=True) as rec:
+                warnings.simplefilter("always")
                 sim.check_gradients(n_steps=1)
         nan_warnings = [w for w in rec if "NaN" in str(w.message) or "Inf" in str(w.message)]
         assert len(nan_warnings) == 0, "Unexpected NaN/Inf gradient warning"
@@ -765,3 +828,26 @@ class TestTrainingConvergence:
         assert "val_loss" in h
         assert len(h["val_loss"]) == 2
         assert all(np.isfinite(v) for v in h["val_loss"])
+
+    def test_training_moves_output_toward_target(self):
+        """After training on target=0, mean absolute output should decrease."""
+        net, inp, out, p = _make_simple_net()
+        x_eval = np.ones((8, 1, 1), dtype=np.float32)
+        x_train = np.ones((32, 1, 1), dtype=np.float32)
+        y_train = np.zeros((32, 1, 1), dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_eval})
+            out_before = np.abs(sim.data[p]).mean()
+
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            sim.fit(x={inp: x_train}, y={p: y_train}, n_steps=1, epochs=20)
+
+            sim.reset_state()
+            sim.run_steps(1, data={inp: x_eval})
+            out_after = np.abs(sim.data[p]).mean()
+
+        assert out_after < out_before, (
+            f"Mean absolute output should decrease toward 0 after training: "
+            f"{out_before:.4f} → {out_after:.4f}"
+        )

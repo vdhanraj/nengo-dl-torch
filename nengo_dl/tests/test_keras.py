@@ -200,7 +200,7 @@ class TestEvaluate:
         assert np.isfinite(result["loss"])
 
     def test_evaluate_after_fit(self):
-        """Evaluation loss after training should be lower than before."""
+        """Evaluation loss after training should be strictly lower than before."""
         net, inp, p = _trainable_net()
         x, y = _xy(n=32)
 
@@ -210,19 +210,30 @@ class TestEvaluate:
             sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=10)
             after = sim.evaluate(x={inp: x}, y={p: y}, n_steps=1)["loss"]
 
-        assert after <= before + 0.1  # allow small tolerance
+        assert after < before, f"Loss should decrease: {before:.4f} → {after:.4f}"
 
     def test_evaluate_zero_target_near_zero(self):
-        """If input and target are both zero, loss should be nearly 0."""
-        net, inp, p = _trainable_net()
-        x = np.zeros((16, 1, 1), dtype=np.float32)
-        y = np.zeros((16, 1, 1), dtype=np.float32)
+        """Identity network (W=1, b=0): zero input vs zero target gives near-zero MSE."""
+        linear = torch.nn.Linear(1, 1)
+        with torch.no_grad():
+            linear.weight.fill_(1.0)
+            linear.bias.fill_(0.0)
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            out = nengo_dl.Layer(linear)(inp)
+            p = nengo.Probe(out, synapse=None)
+
+        x = np.zeros((8, 1, 1), dtype=np.float32)
+        y = np.zeros((8, 1, 1), dtype=np.float32)
 
         with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
             sim.compile(optimizer="adam", loss={p: "mse"})
             result = sim.evaluate(x={inp: x}, y={p: y}, n_steps=1)
 
-        assert result["loss"] < 1.0
+        assert result["loss"] < 1e-8, (
+            f"Expected near-zero MSE for zero input vs zero target, got {result['loss']}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -301,3 +312,84 @@ class TestLinearNet:
                 epochs=5,
             )
         assert "loss" in hist
+
+
+# ---------------------------------------------------------------------------
+# Behavioral correctness
+# ---------------------------------------------------------------------------
+
+class TestBehavioralCorrectness:
+    def test_exact_mse_loss_value(self):
+        """Identity TorchNode (W=1, b=0): MSE of known x vs y equals (x-y)^2."""
+        x_val, y_val = 3.0, 1.0
+        expected_mse = (x_val - y_val) ** 2  # = 4.0
+
+        linear = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            linear.weight.fill_(1.0)  # output = input exactly
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            out = nengo_dl.Layer(linear)(inp)
+            p = nengo.Probe(out, synapse=None)
+
+        x = np.full((8, 1, 1), x_val, dtype=np.float32)
+        y = np.full((8, 1, 1), y_val, dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            result = sim.evaluate(x={inp: x}, y={p: y}, n_steps=1)
+
+        np.testing.assert_allclose(
+            result["loss"], expected_mse, rtol=1e-4,
+            err_msg=f"Expected MSE={expected_mse}, got {result['loss']}",
+        )
+
+    def test_fit_output_moves_toward_target(self):
+        """After training on target=0, the mean absolute output decreases."""
+        net, inp, p = _trainable_net()
+        x_train = np.ones((32, 1, 1), dtype=np.float32)
+        y_train = np.zeros((32, 1, 1), dtype=np.float32)
+        x_eval = x_train[:8]
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            loss_before = sim.evaluate(x={inp: x_eval}, y={p: y_train[:8]}, n_steps=1)["loss"]
+            sim.fit(x={inp: x_train}, y={p: y_train}, n_steps=1, epochs=20)
+            loss_after = sim.evaluate(x={inp: x_eval}, y={p: y_train[:8]}, n_steps=1)["loss"]
+
+        assert loss_after < loss_before, (
+            f"Output should move toward target=0 after training: "
+            f"loss {loss_before:.4f} → {loss_after:.4f}"
+        )
+
+    def test_sgd_weight_update_direction(self):
+        """SGD step on positive output vs zero target must decrease the weight."""
+        import torch.nn as nn
+
+        linear = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            linear.weight.fill_(1.0)
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            out = nengo_dl.Layer(linear)(inp)
+            p = nengo.Probe(out, synapse=None)
+
+        # output = W * input = 1.0 * 1.0 = 1.0; target = 0.0
+        # dL/dW = 2*(1.0 - 0.0)*1.0 = 2.0  → SGD decreases W
+        x = np.ones((8, 1, 1), dtype=np.float32)
+        y = np.zeros((8, 1, 1), dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            w_before = linear.weight.item()
+            sim.compile(
+                optimizer=torch.optim.SGD(sim.trainable_params(), lr=0.1),
+                loss={p: "mse"},
+            )
+            sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=1)
+            w_after = linear.weight.item()
+
+        assert w_after < w_before, (
+            f"SGD should decrease weight toward zero: {w_before:.4f} → {w_after:.4f}"
+        )
