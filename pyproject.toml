@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nengo-dl"
+version = "1.0.0"
+description = "PyTorch backend for Nengo deep learning"
+readme = "README.rst"
+requires-python = ">=3.8"
+license = {text = "Apache 2.0"}
+dependencies = [
+    "nengo>=3.0",
+    "torch>=1.9",
+    "numpy>=1.19",
+]
+
+[project.optional-dependencies]
+tests = ["pytest", "pytest-cov"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nengo_dl*"]

@@ -1,0 +1,7 @@
+nengo>=3.0
+torch>=1.9
+numpy>=1.19
+
+[tests]
+pytest
+pytest-cov
