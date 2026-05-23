@@ -154,10 +154,18 @@ class TestLayer:
         assert out_node.size_out == 8
 
     def test_layer_with_neuron_type(self):
-        """Layer(RectifiedLinear) applies activation to existing node."""
+        """Layer(RectifiedLinear) creates an Ensemble that preserves spiking."""
         with nengo.Network(seed=0) as net:
             inp = nengo.Node(np.zeros(6))
             act = nengo_dl.Layer(nengo.RectifiedLinear())(inp)
+        assert not isinstance(act, TorchNode)
+        assert act.size_out == 6
+
+    def test_layer_with_neuron_type_use_rate(self):
+        """Layer(RectifiedLinear, use_rate=True) creates a rate TorchNode."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(6))
+            act = nengo_dl.Layer(nengo.RectifiedLinear(), use_rate=True)(inp)
         assert isinstance(act, TorchNode)
         assert act.size_out == 6
 

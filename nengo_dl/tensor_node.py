@@ -424,6 +424,12 @@ class Layer:
     Supports both ``nn.Module`` layers (Conv2d, Linear, etc.) and Nengo
     ``NeuronType`` objects (LIF, RectifiedLinear, etc.) as activation layers.
 
+    For NeuronType layers, the default behavior is to create a
+    ``nengo.Ensemble`` with the given neuron type, which preserves spiking
+    behavior during inference.  Pass ``use_rate=True`` to convert the neuron
+    type to a differentiable rate-approximation module instead (useful when
+    backpropagating through the activation layer during training).
+
     Examples
     --------
     ::
@@ -434,21 +440,31 @@ class Layer:
             # Convolutional layer (PyTorch Conv2d)
             x = nengo_dl.Layer(nn.Conv2d(1, 32, 3))(inp, shape_in=(28, 28, 1))
 
-            # Neuron activation layer
+            # Neuron activation layer — preserves spiking (default)
             x = nengo_dl.Layer(nengo.LIF(amplitude=0.01))(x)
+
+            # Neuron activation layer — differentiable rate approximation
+            x = nengo_dl.Layer(nengo.LIF(amplitude=0.01), use_rate=True)(x)
 
             # Linear readout
             out = nengo_dl.Layer(nn.Linear(21632, 10))(x)
     """
 
-    def __init__(self, layer):
+    def __init__(self, layer, use_rate: bool = False):
         """
         Parameters
         ----------
         layer : nn.Module or NeuronType
             The layer or activation to apply.
+        use_rate : bool, optional
+            Only relevant for ``NeuronType`` layers.  If ``True``, convert the
+            neuron type to a differentiable rate-approximation ``nn.Module``
+            (the previous default behaviour).  If ``False`` (default), create
+            a ``nengo.Ensemble`` using the neuron type directly, which
+            preserves spiking dynamics during inference.
         """
         self.layer = layer
+        self.use_rate = use_rate
 
     def __call__(
         self,
@@ -458,7 +474,7 @@ class Layer:
         synapse=None,
         label: Optional[str] = None,
         transform=1,
-    ) -> TorchNode:
+    ):
         """Apply the layer to a Nengo object.
 
         Parameters
@@ -479,8 +495,12 @@ class Layer:
 
         Returns
         -------
-        TorchNode
-            The created node (which can be used as input to further layers).
+        TorchNode or nengo.ensemble.Neurons
+            For ``nn.Module`` inputs: a ``TorchNode``.
+            For ``NeuronType`` inputs with ``use_rate=False`` (default): the
+            ``.neurons`` view of the created ``nengo.Ensemble``.
+            For ``NeuronType`` inputs with ``use_rate=True``: a ``TorchNode``
+            wrapping the rate-approximation module.
         """
         layer = self.layer
 
@@ -500,20 +520,33 @@ class Layer:
 
         # Handle NeuronType (activation layer)
         if isinstance(layer, nengo.neurons.NeuronType):
-            module = neuron_type_to_module(layer)
-            size_out = size_in
-            shape_out = shape_in
-
-            node = TorchNode(
-                module,
-                size_in=size_in,
-                size_out=size_out,
-                shape_in=shape_in,
-                shape_out=shape_out,
-                label=label or f"Layer({type(layer).__name__})",
-            )
-            nengo.Connection(nengo_input, node, synapse=synapse, transform=transform)
-            return node
+            if self.use_rate:
+                # Explicit rate mode: convert to differentiable rate module
+                module = neuron_type_to_module(layer)
+                size_out = size_in
+                shape_out = shape_in
+                node = TorchNode(
+                    module,
+                    size_in=size_in,
+                    size_out=size_out,
+                    shape_in=shape_in,
+                    shape_out=shape_out,
+                    label=label or f"Layer({type(layer).__name__})",
+                )
+                nengo.Connection(nengo_input, node, synapse=synapse, transform=transform)
+                return node
+            else:
+                # Default: create Ensemble with the actual neuron type so that
+                # spiking behaviour is preserved during inference.
+                ens = nengo.Ensemble(
+                    n_neurons=size_in,
+                    dimensions=1,
+                    neuron_type=layer,
+                    label=label or f"Layer({type(layer).__name__})",
+                )
+                nengo.Connection(nengo_input, ens.neurons, synapse=synapse,
+                                 transform=transform)
+                return ens.neurons
 
         # Handle nn.Module layers
         if isinstance(layer, nn.Module):
