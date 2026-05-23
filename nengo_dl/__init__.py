@@ -35,7 +35,7 @@ from .tensor_node import TorchNode, Layer
 from .converter import Converter
 from .config import configure_settings, get_setting
 from .neurons import SoftLIFRate, SpikingLeakyReLU, LeakyReLU
-from . import losses
+from . import losses, dists, benchmarks
 
 # Convenience re-export so users can write ``nengo_dl.Builder``
 from .builder import Builder, OpBuilder, BuildConfig

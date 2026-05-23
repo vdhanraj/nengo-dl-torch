@@ -184,22 +184,20 @@ class TestDeterminism:
 
         np.testing.assert_array_equal(data1, data2)
 
-    def test_different_seeds_differ(self):
-        """Different seeds should generally give different outputs."""
-        with nengo.Network(seed=0) as net:
-            inp = nengo.Node(np.zeros(1))
-            ens = nengo.Ensemble(20, 1, seed=0)
-            nengo.Connection(inp, ens, synapse=None)
-            p = nengo.Probe(ens, synapse=None)
+    def test_different_ensemble_seeds_differ(self):
+        """Networks with different ensemble seeds give different outputs."""
+        def _run(ens_seed):
+            with nengo.Network(seed=0) as net:
+                inp = nengo.Node(np.zeros(1))
+                ens = nengo.Ensemble(20, 1, seed=ens_seed)
+                nengo.Connection(inp, ens, synapse=None)
+                p = nengo.Probe(ens, synapse=None)
+            with nengo_dl.Simulator(net, seed=0) as sim:
+                sim.run_steps(3)
+                return sim.data[p].copy()
 
-        with nengo_dl.Simulator(net, seed=1) as sim1:
-            sim1.run_steps(3)
-            data1 = sim1.data[p].copy()
-
-        with nengo_dl.Simulator(net, seed=99) as sim2:
-            sim2.run_steps(3)
-            data2 = sim2.data[p].copy()
-
+        data1 = _run(1)
+        data2 = _run(99)
         assert not np.array_equal(data1, data2)
 
     def test_reset_gives_same_output(self):

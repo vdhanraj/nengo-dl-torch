@@ -58,7 +58,7 @@ class TestSubModuleImports:
 
     def test_losses_module(self):
         import nengo_dl.losses
-        assert hasattr(nengo_dl.losses, "MSELoss")
+        assert hasattr(nengo_dl.losses, "MSE")
 
     def test_utils_module(self):
         import nengo_dl.utils

@@ -4,8 +4,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import nengo
+import nengo.dists
 from nengo.builder.operator import Operator
-from nengo.builder.signal import Signal
+from nengo.builder.signal import Signal as NengoSignal
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +144,47 @@ def make_two_layer_net(seed=0):
 
 def make_signal(shape, name="sig", trainable=False):
     """Create a Nengo Signal with the given shape."""
-    return Signal(np.zeros(shape), name=name, shape=shape)
+    return NengoSignal(np.zeros(shape), name=name, shape=shape)
 
 
 def make_signal_pair(shape, name_a="sig_a", name_b="sig_b"):
     """Create two independent signals with the same shape."""
     return make_signal(shape, name_a), make_signal(shape, name_b)
+
+
+# ---------------------------------------------------------------------------
+# Compatibility helpers used by test_nengo_tests / test_keras
+# ---------------------------------------------------------------------------
+
+class Probe(nengo.Probe):
+    """Minimal Probe that bypasses target validation (for use with raw Signals)."""
+
+    def __init__(self, target=None, add_to_container=True):
+        # pylint: disable=super-init-not-called
+        if target is not None:
+            nengo.Probe.target.data[self] = target
+
+    @property
+    def size_in(self):
+        return (
+            self.target.size
+            if isinstance(self.target, NengoSignal)
+            else self.target.size_out
+        )
+
+
+def linear_net():
+    """Simple node→node network with a 1× connection and a probe."""
+    with nengo.Network() as net:
+        a = nengo.Node([1])
+        b = nengo.Node(size_in=1)
+        nengo.Connection(a, b, synapse=None, transform=1)
+        p = nengo.Probe(b)
+    return net, a, p
+
+
+def DeterministicLIF(**kwargs):
+    """LIF with deterministic initial voltage (voltage fixed at 0)."""
+    return nengo.LIF(
+        initial_state={"voltage": nengo.dists.Choice([0])}, **kwargs
+    )
