@@ -338,3 +338,113 @@ class TestTopoSortDeterminism:
                     assert w_idx < op_idx, (
                         f"Writer at {w_idx} must precede reader at {op_idx}"
                     )
+
+
+# ---------------------------------------------------------------------------
+# Reference: nengo.Simulator vs nengo_dl.Simulator numerical equality
+# ---------------------------------------------------------------------------
+
+class TestNengoReference:
+    def test_constant_linear_net_matches_nengo(self):
+        """Node(2.0) → transform=3.0 → probe: nengo and nengo_dl give identical output."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([2.0]))
+            b = nengo.Node(size_in=1)
+            nengo.Connection(inp, b, transform=3.0, synapse=None)
+            p = nengo.Probe(b, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(5)
+            dl_out = sim.data[p].copy()
+
+        np.testing.assert_allclose(
+            ref_out, dl_out, atol=1e-5,
+            err_msg="nengo and nengo_dl must agree on constant-input linear net"
+        )
+
+    def test_relu_rate_matches_nengo(self):
+        """ReLU ensemble (rate mode): nengo_dl output matches nengo.Simulator."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([1.5]))
+            ens = nengo.Ensemble(
+                10, 1, neuron_type=nengo.RectifiedLinear(),
+                gain=nengo.dists.Choice([1.0]),
+                bias=nengo.dists.Choice([0.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(3)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(3, inference_mode="rate")
+            dl_out = sim.data[p].copy()
+
+        np.testing.assert_allclose(ref_out, dl_out, atol=1e-4,
+                                   err_msg="ReLU rate mode must match nengo.Simulator")
+
+    def test_lif_spiking_matches_nengo(self):
+        """LIF spiking output: total spike counts agree with nengo.Simulator."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([2.0]))
+            ens = nengo.Ensemble(
+                5, 1, neuron_type=nengo.LIF(),
+                gain=nengo.dists.Choice([2.0]),
+                bias=nengo.dists.Choice([1.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens.neurons, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(10)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(10, inference_mode="spiking")
+            dl_out = sim.data[p].copy()
+
+        # Float32 vs float64 integration can shift spikes by one timestep and
+        # cause off-by-one spike counts in short windows; allow ±1 per neuron.
+        ref_counts = (ref_out > 0).sum(axis=0)
+        dl_counts = (dl_out > 0).sum(axis=0)
+        assert np.all(np.abs(ref_counts - dl_counts) <= 1), (
+            f"LIF spiking: spike counts per neuron must agree within ±1. "
+            f"ref={ref_counts}, dl={dl_counts}"
+        )
+
+    def test_topo_sort_produces_nengo_consistent_output(self):
+        """Sorting ops, then simulating, gives output consistent with nengo.Simulator."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([1.0]))
+            ens = nengo.Ensemble(
+                5, 1, neuron_type=nengo.RectifiedLinear(),
+                gain=nengo.dists.Choice([1.0]),
+                bias=nengo.dists.Choice([0.5]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        # Reference from nengo
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        # nengo_dl (internally uses topo_sort)
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(5, inference_mode="rate")
+            dl_out = sim.data[p].copy()
+
+        np.testing.assert_allclose(ref_out, dl_out, atol=1e-4,
+                                   err_msg="topo_sort-based simulation must match nengo.Simulator")

@@ -18,6 +18,8 @@ import torch.nn.functional as F
 
 import nengo
 
+from .tensor_node import TorchNode, _SpatialModule
+
 
 class ConversionError(Exception):
     """Raised when a PyTorch layer cannot be converted to Nengo."""
@@ -46,6 +48,11 @@ class Converter:
         Options: ``'rectified_linear'``, ``'spiking_relu'``, ``'lif'``,
         ``'softlif'``.  Use ``'spiking_relu'`` for a network that behaves
         like ReLU in rate mode and emits discrete spikes in spiking mode.
+    input_shape : tuple, optional
+        Shape of model inputs before flattening. Required when the first
+        converted layer is spatial, e.g. ``(1, 28, 28)`` for MNIST Conv2d
+        models. ``(28, 28, 1)`` is also accepted when it matches the layer's
+        channel count.
 
     Examples
     --------
@@ -77,6 +84,7 @@ class Converter:
         synapse=None,
         activation_type: str = "rectified_linear",
         dt: float = 0.001,
+        input_shape: Optional[Tuple[int, ...]] = None,
     ):
         self.model = model
         self.allow_fallback = allow_fallback
@@ -84,6 +92,7 @@ class Converter:
         self.synapse = synapse
         self.activation_type = activation_type
         self.dt = dt
+        self.input_shape = tuple(input_shape) if input_shape is not None else None
 
         # Maps layer → nengo object
         self._layer_map: Dict[nn.Module, nengo.Node] = {}
@@ -132,55 +141,49 @@ class Converter:
 
             prev_node = None
             prev_size = None
+            prev_shape = None
 
             for name, layer in layers:
-                prev_node, prev_size = self._convert_layer(
-                    name, layer, prev_node, prev_size
+                prev_node, prev_size, prev_shape = self._convert_layer(
+                    name, layer, prev_node, prev_size, prev_shape
                 )
                 if prev_node is not None:
                     self.outputs[layer] = prev_node
 
-    def _convert_layer(self, name, layer, prev_node, prev_size):
+    def _convert_layer(self, name, layer, prev_node, prev_size, prev_shape):
         """Convert a single layer and return (output_node, output_size)."""
 
         if isinstance(layer, nn.Linear):
-            return self._convert_linear(name, layer, prev_node, prev_size)
+            return self._convert_linear(name, layer, prev_node, prev_size, prev_shape)
 
         elif isinstance(layer, (nn.ReLU, nn.LeakyReLU, nn.Sigmoid, nn.Tanh)):
-            return self._convert_activation(name, layer, prev_node, prev_size)
+            return self._convert_activation(name, layer, prev_node, prev_size, prev_shape)
 
-        elif isinstance(layer, (nn.Conv1d, nn.Conv2d)):
-            return self._convert_conv(name, layer, prev_node, prev_size)
+        elif isinstance(layer, nn.Conv2d):
+            return self._convert_conv2d(name, layer, prev_node, prev_size, prev_shape)
 
         elif isinstance(layer, (nn.Flatten, nn.Identity)):
-            return self._convert_flatten(name, layer, prev_node, prev_size)
+            return self._convert_flatten(name, layer, prev_node, prev_size, prev_shape)
 
         elif isinstance(layer, nn.Sequential):
             # Recursively convert sub-layers
             for sub_name, sub_layer in layer.named_children():
-                prev_node, prev_size = self._convert_layer(
-                    f"{name}/{sub_name}", sub_layer, prev_node, prev_size
+                prev_node, prev_size, prev_shape = self._convert_layer(
+                    f"{name}/{sub_name}", sub_layer, prev_node, prev_size, prev_shape
                 )
-            return prev_node, prev_size
+            return prev_node, prev_size, prev_shape
 
         else:
             if self.allow_fallback:
-                return self._convert_fallback(name, layer, prev_node, prev_size)
+                return self._convert_fallback(name, layer, prev_node, prev_size, prev_shape)
             else:
                 raise ConversionError(
                     f"No converter for layer type {type(layer).__name__}. "
                     "Set allow_fallback=True to wrap unsupported layers."
                 )
 
-    def _convert_linear(self, name, layer: nn.Linear, prev_node, prev_size):
-        """Convert nn.Linear to a Nengo Ensemble + connection.
-
-        When ``scale_firing_rates=S`` is set:
-        - neuron gains are set to S so neurons fire at up to S Hz
-        - neuron type amplitude is set to 1/S (see ``_get_neuron_type``)
-        - result: probe(ens.neurons) == amplitude * rate == relu(W*x+b) in rate mode
-        - weights and biases are kept at their original PyTorch values
-        """
+    def _convert_linear(self, name, layer: nn.Linear, prev_node, prev_size, prev_shape):
+        """Convert nn.Linear to a linear Nengo Node plus trainable connections."""
         in_size = layer.in_features
         out_size = layer.out_features
         weights = layer.weight.data.cpu().numpy()  # (out, in)
@@ -193,51 +196,121 @@ class Converter:
             self._layer_map[layer] = node
             prev_node = node
             prev_size = in_size
+            prev_shape = (in_size,)
 
-        # gain controls peak firing rate; amplitude in neuron type rescales output.
-        # Because J = gain * (W@x) + bias, the effective bias contribution to the
-        # probe is (amplitude * gain * ... + amplitude * bias).  To keep the bias
-        # acting in the same units as the weights, scale bias by gain here.
-        scale = float(self.scale_firing_rates) if self.scale_firing_rates else 1.0
-        gain = np.full(out_size, scale)
-        bias_scaled = (bias * scale) if bias is not None else np.zeros(out_size)
+        out = nengo.Node(size_in=out_size, label=name)
 
-        # Output ensemble
-        neuron_type = self._get_neuron_type()
-        ens = nengo.Ensemble(
-            out_size,
-            dimensions=1,
-            neuron_type=neuron_type,
-            gain=gain,
-            bias=bias_scaled,
-            label=name,
+        # Only filter spike-train outputs (from neuron ensembles); plain nodes
+        # carry continuous signals and don't need a synaptic low-pass filter.
+        conn_synapse = (
+            self.synapse if isinstance(prev_node, nengo.ensemble.Neurons) else None
         )
-
-        # Connection with the weight matrix as transform (unscaled)
         nengo.Connection(
             prev_node,
-            ens.neurons,
+            out,
             transform=weights,
-            synapse=self.synapse,
+            synapse=conn_synapse,
         )
+        if bias is not None:
+            bias_node = nengo.Node([1.0], label=f"{name}_bias")
+            nengo.Connection(
+                bias_node,
+                out,
+                transform=bias.reshape(out_size, 1),
+                synapse=None,
+            )
 
+        self._layer_map[layer] = out
+        return out, out_size, (out_size,)
+
+    def _convert_activation(self, name, layer, prev_node, prev_size, prev_shape):
+        """Convert activation layer.
+
+        Linear layers place their activation directly on the output Ensemble, so
+        a following ReLU can be skipped. Spatial TorchNode layers output linear
+        activations, so they need an explicit neuron Ensemble here.
+        """
+        if isinstance(prev_node, nengo.ensemble.Neurons):
+            return prev_node, prev_size, prev_shape
+
+        if prev_node is None or prev_size is None:
+            return prev_node, prev_size, prev_shape
+
+        scale = float(self.scale_firing_rates) if self.scale_firing_rates else 1.0
+        ens = nengo.Ensemble(
+            prev_size,
+            dimensions=1,
+            neuron_type=self._get_neuron_type(),
+            gain=np.ones(prev_size),
+            bias=np.zeros(prev_size),
+            label=name,
+        )
+        # Apply scale_firing_rates as the connection transform rather than as
+        # Ensemble gain. Connecting to ens.neurons injects current directly,
+        # bypassing the Ensemble's encoding path (gain/bias), so the gain
+        # parameter is silently ignored. The transform achieves the same
+        # J_i = scale × input_i, making spiking rate = scale × conv_output and
+        # amplitude = 1/scale so that filtered output recovers the original value.
+        nengo.Connection(prev_node, ens.neurons, transform=scale, synapse=None)
         self._layer_map[layer] = ens.neurons
-        return ens.neurons, out_size
+        return ens.neurons, prev_size, prev_shape
 
-    def _convert_activation(self, name, layer, prev_node, prev_size):
-        """Convert activation layer (already handled by neuron type in ensemble)."""
-        # Activation is incorporated into the neuron type; skip as separate layer
-        return prev_node, prev_size
+    def _convert_conv2d(self, name, layer: nn.Conv2d, prev_node, prev_size, prev_shape):
+        """Convert Conv2d to a TorchNode with flat Nengo I/O."""
+        if prev_node is None:
+            if self.input_shape is None:
+                raise ConversionError(
+                    "Converter(input_shape=...) is required when the first "
+                    "converted layer is Conv2d."
+                )
+            prev_shape = self.input_shape
+            prev_size = int(np.prod(prev_shape))
+            prev_node = nengo.Node(np.zeros(prev_size), label=f"{name}_input")
+            self.inputs[layer] = prev_node
+            self._layer_map[layer] = prev_node
 
-    def _convert_conv(self, name, layer, prev_node, prev_size):
-        """Convert convolutional layer using a TorchNode fallback."""
-        return self._convert_fallback(name, layer, prev_node, prev_size)
+        if prev_shape is None or len(prev_shape) != 3:
+            raise ConversionError(
+                f"Conv2d layer '{name}' requires a spatial input shape, "
+                f"got {prev_shape!r}."
+            )
 
-    def _convert_flatten(self, name, layer, prev_node, prev_size):
+        module = _SpatialModule(layer, prev_shape)
+        if prev_shape[0] == layer.in_channels:
+            c, h, w = prev_shape
+        else:
+            h, w, c = prev_shape
+        try:
+            layer_device = next(layer.parameters()).device
+        except StopIteration:
+            layer_device = torch.device("cpu")
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w, device=layer_device)
+            out = layer(dummy)
+        _, out_c, out_h, out_w = out.shape
+        shape_out = (out_c, out_h, out_w)
+        size_out = int(np.prod(shape_out))
+
+        node = TorchNode(
+            module,
+            size_in=prev_size,
+            size_out=size_out,
+            shape_in=prev_shape,
+            shape_out=(size_out,),
+            label=name,
+        )
+        conn_synapse = (
+            self.synapse if isinstance(prev_node, nengo.ensemble.Neurons) else None
+        )
+        nengo.Connection(prev_node, node, synapse=conn_synapse)
+        self._layer_map[layer] = node
+        return node, size_out, shape_out
+
+    def _convert_flatten(self, name, layer, prev_node, prev_size, prev_shape):
         """Flatten is a no-op at the Nengo level (signals are always flat)."""
-        return prev_node, prev_size
+        return prev_node, prev_size, (prev_size,) if prev_size is not None else None
 
-    def _convert_fallback(self, name, layer, prev_node, prev_size):
+    def _convert_fallback(self, name, layer, prev_node, prev_size, prev_shape):
         """Wrap an unsupported layer as a passthrough nengo.Node."""
         warnings.warn(
             f"Layer {type(layer).__name__} ('{name}') is not natively supported; "
@@ -246,7 +319,7 @@ class Converter:
 
         if prev_node is None or prev_size is None:
             warnings.warn(f"Cannot create fallback node for {name}; skipping.")
-            return prev_node, prev_size
+            return prev_node, prev_size, prev_shape
 
         # Probe the layer to get output size
         try:
@@ -256,7 +329,7 @@ class Converter:
                 out_size = int(out.numel())
         except Exception:
             warnings.warn(f"Cannot determine output size for {name}; skipping.")
-            return prev_node, prev_size
+            return prev_node, prev_size, prev_shape
 
         def layer_fn(t, x):
             with torch.no_grad():
@@ -266,9 +339,12 @@ class Converter:
 
         node = nengo.Node(layer_fn, size_in=prev_size, size_out=out_size, label=name)
         if prev_node is not None:
-            nengo.Connection(prev_node, node, synapse=self.synapse)
+            conn_synapse = (
+                self.synapse if isinstance(prev_node, nengo.ensemble.Neurons) else None
+            )
+            nengo.Connection(prev_node, node, synapse=conn_synapse)
         self._layer_map[layer] = node
-        return node, out_size
+        return node, out_size, (out_size,)
 
 
 def _iter_layers(model: nn.Module, prefix: str = ""):

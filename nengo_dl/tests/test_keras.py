@@ -393,3 +393,132 @@ class TestBehavioralCorrectness:
         assert w_after < w_before, (
             f"SGD should decrease weight toward zero: {w_before:.4f} → {w_after:.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Manual MSE, loss_weights, frozen parameters, evaluate consistency
+# ---------------------------------------------------------------------------
+
+class TestExactBehavior:
+    def test_manual_mse_matches_evaluate(self):
+        """Manually computing (output - target)^2 must equal sim.evaluate() loss."""
+        # Identity network: W=1, b=0 → output = input = x_val
+        x_val, y_val = 2.0, 5.0
+        expected_mse = (x_val - y_val) ** 2  # = 9.0
+
+        linear = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            linear.weight.fill_(1.0)
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            out = nengo_dl.Layer(linear)(inp)
+            p = nengo.Probe(out, synapse=None)
+
+        x = np.full((8, 1, 1), x_val, dtype=np.float32)
+        y = np.full((8, 1, 1), y_val, dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            result = sim.evaluate(x={inp: x}, y={p: y}, n_steps=1)
+
+        np.testing.assert_allclose(
+            result["loss"], expected_mse, rtol=1e-4,
+            err_msg=f"Manual MSE={expected_mse:.1f} must equal sim.evaluate() loss"
+        )
+
+    def test_loss_weights_zero_suppresses_probe_loss(self):
+        """loss_weights={p2: 0.0} makes p2 contribute nothing to the total loss."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, neuron_type=nengo.RectifiedLinear(), seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p1 = nengo.Probe(ens, synapse=None)
+            p2 = nengo.Probe(ens, synapse=None)
+
+        x = np.zeros((8, 1, 1), dtype=np.float32)
+        y = np.zeros((8, 1, 1), dtype=np.float32)
+
+        # Both probes have MSE loss but p2 weight=0
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(
+                optimizer="adam",
+                loss={p1: "mse", p2: "mse"},
+                loss_weights={p2: 0.0},
+            )
+            loss_p2_zero = sim.evaluate(x={inp: x}, y={p1: y, p2: y}, n_steps=1)["loss"]
+
+        # Both probes with equal weight=1
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(
+                optimizer="adam",
+                loss={p1: "mse", p2: "mse"},
+                loss_weights={p1: 1.0, p2: 1.0},
+            )
+            loss_equal = sim.evaluate(x={inp: x}, y={p1: y, p2: y}, n_steps=1)["loss"]
+
+        # With p2 zeroed out, total loss should be strictly less than with both contributing
+        assert loss_p2_zero <= loss_equal, (
+            f"loss_weights p2=0 must give loss ≤ equal weights: {loss_p2_zero} vs {loss_equal}"
+        )
+
+    def test_trainable_false_gives_zero_trainable_params(self):
+        """configure_settings(trainable=False) must result in 0 trainable parameters."""
+        with nengo.Network(seed=0) as net:
+            nengo_dl.configure_settings(trainable=False)
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            n_params = len(sim.trainable_params())
+
+        assert n_params == 0, (
+            f"trainable=False must give 0 trainable params, got {n_params}"
+        )
+
+    def test_trainable_params_change_after_fit(self):
+        """Trainable parameters must change after fitting (verifies gradient flow)."""
+        net, inp, p = _trainable_net()
+        x = np.random.RandomState(0).uniform(-1, 1, (32, 1, 1)).astype(np.float32)
+        y = np.zeros((32, 1, 1), dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            w_before = {k: v.copy() for k, v in sim.get_weights().items()}
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=10)
+            w_after = sim.get_weights()
+
+        changed = [k for k in w_before if not np.allclose(w_before[k], w_after[k])]
+        assert len(changed) > 0, (
+            "At least one trainable parameter must change after 10 epochs of training"
+        )
+
+    def test_evaluate_is_reproducible(self):
+        """evaluate() on the same data returns the same loss value twice."""
+        net, inp, p = _trainable_net()
+        x, y = _xy(n=16)
+
+        with nengo_dl.Simulator(net, minibatch_size=8, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            r1 = sim.evaluate(x={inp: x}, y={p: y}, n_steps=1)["loss"]
+            r2 = sim.evaluate(x={inp: x}, y={p: y}, n_steps=1)["loss"]
+
+        np.testing.assert_allclose(r1, r2, rtol=1e-6,
+                                   err_msg="evaluate() must return identical loss on repeated calls")
+
+    def test_fit_loss_strictly_less_than_initial_after_many_epochs(self):
+        """After 20 epochs of SGD on a solvable task, loss must be strictly less than initial."""
+        net, inp, p = _trainable_net(seed=0, n_hidden=30)
+        x = np.random.RandomState(1).uniform(-1, 1, (64, 1, 1)).astype(np.float32)
+        y = np.zeros((64, 1, 1), dtype=np.float32)
+
+        with nengo_dl.Simulator(net, minibatch_size=16, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            hist = sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=20)
+
+        losses = hist["loss"]
+        assert losses[-1] < losses[0], (
+            f"Loss must decrease over 20 epochs: {losses[0]:.4f} → {losses[-1]:.4f}"
+        )

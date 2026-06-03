@@ -64,6 +64,10 @@ class CrossEntropy(nn.Module):
         if target.dtype in (torch.float32, torch.float64):
             # One-hot → hard labels
             if target.dim() == pred.dim():
+                # Broadcast target along time axis if shapes don't match
+                # (e.g. target has 1 time step but pred has n_steps).
+                if target.shape[1] != t:
+                    target = target.expand(b, t, *target.shape[2:])
                 target = target.reshape(b * t, -1)
                 if self.from_logits:
                     return F.cross_entropy(

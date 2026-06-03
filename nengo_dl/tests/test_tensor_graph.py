@@ -314,10 +314,18 @@ class TestWeightManagement:
         for k in w1:
             np.testing.assert_allclose(w1[k], w2[k], rtol=1e-5)
 
-    def test_set_weights_ignores_unknown_keys(self):
+    def test_set_weights_strict_raises_on_unknown_key(self):
+        """strict=True (default) raises ValueError for unknown weight keys."""
         net, inp, p = _simple_net()
         tg = _build(net)
-        tg.set_weights({"nonexistent_key_xyz": np.zeros(5)})  # must not raise
+        with pytest.raises(ValueError, match="Unknown weight keys"):
+            tg.set_weights({"nonexistent_key_xyz": np.zeros(5)})
+
+    def test_set_weights_lenient_ignores_unknown_keys(self):
+        """strict=False silently ignores keys that don't exist in the model."""
+        net, inp, p = _simple_net()
+        tg = _build(net)
+        tg.set_weights({"nonexistent_key_xyz": np.zeros(5)}, strict=False)  # must not raise
 
     def test_set_weights_changes_forward_output(self):
         """set_weights with different values must change the forward output."""
@@ -555,3 +563,59 @@ class TestTorchModuleDiscovery:
             sim.run_steps(1, data={inp: x})
         np.testing.assert_allclose(sim.data[p][0], [3.0, 8.0], atol=1e-4,
                                    err_msg="TorchNode linear output must match W@x")
+
+
+# ---------------------------------------------------------------------------
+# nengo.Simulator reference comparisons for TensorGraph
+# ---------------------------------------------------------------------------
+
+class TestNengoReference:
+    def test_forward_constant_input_matches_nengo(self):
+        """TensorGraph.forward on Node(2.0)→transform=3.0 matches nengo.Simulator."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([2.0]))
+            b = nengo.Node(size_in=1)
+            nengo.Connection(inp, b, transform=3.0, synapse=None)
+            p = nengo.Probe(b, synapse=None)
+
+        model = NengoModel()
+        NengoBuilder.build(model, net)
+        tg = TensorGraph(model, dt=0.001, minibatch_size=1, device="cpu")
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        result = tg.forward(5)
+        dl_out = result[p].detach().cpu().numpy().squeeze(0)  # (5, 1)
+
+        np.testing.assert_allclose(ref_out, dl_out, atol=1e-5,
+                                   err_msg="TensorGraph must match nengo.Simulator on linear net")
+
+    def test_forward_relu_rate_matches_nengo(self):
+        """TensorGraph ReLU rate mode matches nengo.Simulator."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([1.5]))
+            ens = nengo.Ensemble(
+                6, 1, neuron_type=nengo.RectifiedLinear(),
+                gain=nengo.dists.Choice([1.0]),
+                bias=nengo.dists.Choice([0.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        model = NengoModel()
+        NengoBuilder.build(model, net)
+        tg = TensorGraph(model, dt=0.001, minibatch_size=1, device="cpu")
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        result = tg.forward(5, rate_mode=True)
+        dl_out = result[p].detach().cpu().numpy().squeeze(0)  # (5, 1)
+
+        np.testing.assert_allclose(ref_out, dl_out, atol=1e-4,
+                                   err_msg="TensorGraph ReLU rate mode must match nengo.Simulator")

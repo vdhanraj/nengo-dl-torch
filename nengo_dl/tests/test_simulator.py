@@ -189,6 +189,27 @@ class TestRunSteps:
                 err_msg=f"Batch item {i}: expected {v}, got {out[i,0,0]}",
             )
 
+    def test_python_node_runs_per_batch_item(self):
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            out = nengo.Node(output=lambda t, x: x + t, size_in=1, size_out=1)
+            nengo.Connection(inp, out, synapse=None)
+            p = nengo.Probe(out, synapse=None)
+
+        x = np.array([[[1.0]], [[2.0]]], dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            sim.run_steps(1, data={inp: x})
+            out_data = sim.data[p]
+
+        np.testing.assert_allclose(out_data[:, 0, 0], [1.001, 2.001], atol=1e-5)
+
+    def test_run_steps_partial_batch_raises(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.ones((3, 1, 1), dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            with pytest.raises(ValueError, match="divisible"):
+                sim.run_steps(1, data={inp: x})
+
     def test_probe_with_synapse_filters_signal(self):
         """Synapse probe: step response starts below the step, converges over time."""
         tau = 0.01
@@ -283,6 +304,24 @@ class TestTraining:
         with nengo_dl.Simulator(net, seed=0) as sim:
             with pytest.raises(ValueError, match="[Uu]nknown optimizer"):
                 sim.compile(optimizer="notanoptimizer", loss={p: "mse"})
+
+    def test_fit_accepts_single_sample_2d_shapes(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.array([[1.0], [1.0], [1.0]], dtype=np.float32)
+        y = np.zeros((3, 1), dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=1, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            history = sim.fit(x={inp: x}, y={p: y}, n_steps=3, epochs=1, verbose=0)
+        assert np.isfinite(history["loss"][0])
+
+    def test_fit_partial_batch_raises(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.ones((3, 1, 1), dtype=np.float32)
+        y = np.zeros((3, 1, 1), dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            sim.compile(optimizer="adam", loss={p: "mse"})
+            with pytest.raises(ValueError, match="divisible"):
+                sim.fit(x={inp: x}, y={p: y}, n_steps=1, epochs=1)
 
 
 # ---------------------------------------------------------------------------
@@ -851,3 +890,125 @@ class TestTrainingConvergence:
             f"Mean absolute output should decrease toward 0 after training: "
             f"{out_before:.4f} → {out_after:.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# nengo.Simulator reference comparisons
+# ---------------------------------------------------------------------------
+
+class TestNengoReference:
+    @staticmethod
+    def _configure_decoder_cache(tmp_path):
+        cache_dir = tmp_path / "nengo_decoder_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        nengo.rc["decoder_cache"]["path"] = str(cache_dir)
+
+    def test_constant_linear_net_matches_nengo(self, tmp_path):
+        """Node(3.0) → transform=2.0 → probe: nengo_dl must match nengo exactly."""
+        self._configure_decoder_cache(tmp_path)
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([3.0]))
+            b = nengo.Node(size_in=1)
+            nengo.Connection(inp, b, transform=2.0, synapse=None)
+            p = nengo.Probe(b, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(5)
+            dl_out = sim.data[p].copy()
+
+        np.testing.assert_allclose(
+            ref_out, dl_out, atol=1e-5,
+            err_msg="Constant-input linear net: nengo_dl must match nengo.Simulator"
+        )
+
+    def test_relu_rate_mode_matches_nengo(self, tmp_path):
+        """ReLU ensemble rate mode: nengo_dl output matches nengo.Simulator."""
+        self._configure_decoder_cache(tmp_path)
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([2.0]))
+            ens = nengo.Ensemble(
+                8, 1, neuron_type=nengo.RectifiedLinear(),
+                gain=nengo.dists.Choice([1.0]),
+                bias=nengo.dists.Choice([0.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(5, inference_mode="rate")
+            dl_out = sim.data[p].copy()
+
+        np.testing.assert_allclose(ref_out, dl_out, atol=1e-4,
+                                   err_msg="ReLU rate mode must match nengo.Simulator")
+
+    def test_lif_spiking_total_spikes_match_nengo(self, tmp_path):
+        """LIF spiking: total spike count per neuron must agree with nengo.Simulator."""
+        self._configure_decoder_cache(tmp_path)
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([2.5]))
+            ens = nengo.Ensemble(
+                5, 1, neuron_type=nengo.LIF(),
+                gain=nengo.dists.Choice([2.0]),
+                bias=nengo.dists.Choice([1.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens.neurons, synapse=None)
+
+        n_steps = 50
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(n_steps)
+            ref_spikes = ref.data[p].sum(axis=0)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(n_steps, inference_mode="spiking")
+            dl_spikes = sim.data[p].sum(axis=0)
+
+        # Nengo encodes spikes as 1/dt per spike (1000 for dt=0.001).
+        # Allow ±2 spikes = ±2*(1/dt) = ±2000 in probe units.
+        spike_unit = 1.0 / 0.001  # = 1000
+        np.testing.assert_allclose(
+            ref_spikes, dl_spikes, atol=2.0 * spike_unit,
+            err_msg="LIF total spike count must match nengo.Simulator within ±2 spikes"
+        )
+
+    def test_two_ensemble_chain_matches_nengo(self, tmp_path):
+        """inp → ens1 → ens2: probe at ens2 matches nengo.Simulator in rate mode."""
+        self._configure_decoder_cache(tmp_path)
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([1.0]))
+            ens1 = nengo.Ensemble(5, 1, neuron_type=nengo.RectifiedLinear(),
+                                  gain=nengo.dists.Choice([1.0]),
+                                  bias=nengo.dists.Choice([0.5]),
+                                  encoders=nengo.dists.Choice([[1.0]]),
+                                  seed=0)
+            ens2 = nengo.Ensemble(5, 1, neuron_type=nengo.RectifiedLinear(),
+                                  gain=nengo.dists.Choice([1.0]),
+                                  bias=nengo.dists.Choice([0.0]),
+                                  encoders=nengo.dists.Choice([[1.0]]),
+                                  seed=1)
+            nengo.Connection(inp, ens1, synapse=None)
+            nengo.Connection(ens1, ens2, synapse=None)
+            p = nengo.Probe(ens2, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(5)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(5, inference_mode="rate")
+            dl_out = sim.data[p].copy()
+
+        np.testing.assert_allclose(ref_out, dl_out, atol=1e-3,
+                                   err_msg="Two-ensemble chain must match nengo.Simulator")

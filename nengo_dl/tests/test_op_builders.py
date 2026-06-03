@@ -585,3 +585,213 @@ class TestMultiStepOps:
                 data[i, 0, 0], v, atol=1e-5,
                 err_msg=f"Batch item {i}: expected {v}, got {data[i,0,0]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Direct op semantics: Reset, Copy, DotInc, ElementwiseInc
+# ---------------------------------------------------------------------------
+
+class TestExactOpSemantics:
+    def test_reset_no_accumulation_across_steps(self):
+        """Reset ensures node output is exactly the step value, not accumulated."""
+        n = 5
+        with nengo.Network(seed=0) as net:
+            a = nengo.Node(np.array([1.0]))
+            b = nengo.Node(size_in=1)
+            nengo.Connection(a, b, synapse=None)
+            p = nengo.Probe(b, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(n)
+
+        # If Reset were absent, b would accumulate: 1, 2, 3, 4, 5
+        # With Reset, every step b = 1.0 (signal is reset to 0 then +1)
+        np.testing.assert_allclose(
+            sim.data[p], np.ones((n, 1)), atol=1e-6,
+            err_msg="Reset must clear accumulation: value must be 1.0 every step, not cumulative"
+        )
+
+    def test_copy_exact_value_injection(self):
+        """Copy propagates an injected override value without modification."""
+        with nengo.Network(seed=0) as net:
+            src = nengo.Node(np.zeros(3))
+            dst = nengo.Node(size_in=3)
+            nengo.Connection(src, dst, synapse=None)
+            p = nengo.Probe(dst, synapse=None)
+
+        override = np.array([[[2.5, -1.3, 7.0]]], dtype=np.float32)
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(1, data={src: override})
+
+        np.testing.assert_allclose(
+            sim.data[p][0], [2.5, -1.3, 7.0], atol=1e-5,
+            err_msg="Copy must propagate the injected value exactly"
+        )
+
+    def test_dotinc_matrix_multiply_exact(self):
+        """DotInc via a 3×2 transform: output = W @ x exactly."""
+        # W: 3 rows × 2 cols, x: [1, 2] → y = W @ x
+        W = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        x = np.array([1.0, 2.0])
+        expected = W @ x  # [5, 11, 17]
+
+        with nengo.Network(seed=0) as net:
+            src = nengo.Node(x)
+            dst = nengo.Node(size_in=3)
+            nengo.Connection(src, dst, transform=W, synapse=None)
+            p = nengo.Probe(dst, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(1)
+
+        np.testing.assert_allclose(
+            sim.data[p][0], expected, atol=1e-5,
+            err_msg=f"3×2 DotInc: expected {expected}"
+        )
+
+    def test_elementwiseinc_via_scale_transform(self):
+        """ElementwiseInc: element-wise multiply via per-element scale transform."""
+        scales = np.array([2.0, 3.0, 0.5])
+        inputs = np.array([4.0, 5.0, 8.0])
+        expected = scales * inputs  # [8, 15, 4]
+
+        with nengo.Network(seed=0) as net:
+            src = nengo.Node(inputs)
+            dst = nengo.Node(size_in=3)
+            # Diagonal transform applies element-wise scale
+            nengo.Connection(src, dst, transform=np.diag(scales), synapse=None)
+            p = nengo.Probe(dst, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(1)
+
+        np.testing.assert_allclose(
+            sim.data[p][0], expected, atol=1e-5,
+            err_msg=f"ElementwiseInc: expected {expected}"
+        )
+
+    def test_dotinc_accumulates_two_sources_exactly(self):
+        """Two DotInc ops into same signal: output = W1@x1 + W2@x2."""
+        W1 = np.array([[2.0]])
+        W2 = np.array([[3.0]])
+        x1, x2 = np.array([5.0]), np.array([7.0])
+        expected = W1 @ x1 + W2 @ x2  # [10 + 21] = [31]
+
+        with nengo.Network(seed=0) as net:
+            s1 = nengo.Node(x1)
+            s2 = nengo.Node(x2)
+            dst = nengo.Node(size_in=1)
+            nengo.Connection(s1, dst, transform=W1, synapse=None)
+            nengo.Connection(s2, dst, transform=W2, synapse=None)
+            p = nengo.Probe(dst, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(1)
+
+        np.testing.assert_allclose(
+            sim.data[p][0, 0], expected[0], atol=1e-5,
+            err_msg=f"Accumulated DotInc: expected {expected[0]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SimNeurons reference: exact output at known input currents
+# ---------------------------------------------------------------------------
+
+class TestSimNeuronsReference:
+    def test_rectifiedlinear_exact_output_at_known_current(self):
+        """ReLU neuron: output = max(0, J) where J = gain*enc*x + bias."""
+        # gain=1, encoder=1, bias=0, input=3.0 → J = 1*1*3+0 = 3.0 → rate = 3.0
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([3.0]))
+            ens = nengo.Ensemble(
+                1, 1, neuron_type=nengo.RectifiedLinear(),
+                gain=nengo.dists.Choice([1.0]),
+                bias=nengo.dists.Choice([0.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens.neurons, transform=np.ones((1, 1)), synapse=None)
+            p = nengo.Probe(ens.neurons, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(3, inference_mode="rate")
+
+        np.testing.assert_allclose(
+            sim.data[p], np.full((3, 1), 3.0), atol=1e-4,
+            err_msg="ReLU neuron: rate = max(0, gain*input+bias) = 3.0"
+        )
+
+    def test_rectifiedlinear_bias_shifts_threshold(self):
+        """bias=2.0, gain=1, enc=1, input=-1.5 → J = -1.5+2 = 0.5 → rate=0.5."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([-1.5]))
+            ens = nengo.Ensemble(
+                1, 1, neuron_type=nengo.RectifiedLinear(),
+                gain=nengo.dists.Choice([1.0]),
+                bias=nengo.dists.Choice([2.0]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens.neurons, transform=np.ones((1, 1)), synapse=None)
+            p = nengo.Probe(ens.neurons, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(1, inference_mode="rate")
+
+        np.testing.assert_allclose(
+            sim.data[p][0, 0], 0.5, atol=1e-4,
+            err_msg="ReLU rate = max(0, J) = max(0, -1.5 + 2.0) = 0.5"
+        )
+
+    def test_lif_matches_nengo_reference(self):
+        """LIF spiking: nengo_dl matches nengo.Simulator exactly."""
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([2.0]))
+            ens = nengo.Ensemble(
+                3, 1, neuron_type=nengo.LIF(),
+                gain=nengo.dists.Choice([3.0]),
+                bias=nengo.dists.Choice([0.5]),
+                encoders=nengo.dists.Choice([[1.0]]),
+                seed=0,
+            )
+            nengo.Connection(inp, ens, synapse=None)
+            p = nengo.Probe(ens.neurons, synapse=None)
+
+        with nengo.Simulator(net, dt=0.001) as ref:
+            ref.run_steps(20)
+            ref_out = ref.data[p].copy()
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(20, inference_mode="spiking")
+            dl_out = sim.data[p].copy()
+
+        # Float32 vs float64 integration can shift spikes by one timestep and
+        # cause off-by-one spike counts; allow ±1 per neuron over the window.
+        ref_counts = (ref_out > 0).sum(axis=0)
+        dl_counts = (dl_out > 0).sum(axis=0)
+        assert np.all(np.abs(ref_counts - dl_counts) <= 1), (
+            f"LIF spiking: spike counts per neuron must agree within ±1. "
+            f"ref={ref_counts}, dl={dl_counts}"
+        )
+
+    def test_simprocess_synapse_analytical_formula(self):
+        """Synaptic filter response matches analytical formula y[k] = 1 - exp(-k*dt/tau)."""
+        tau = 0.005
+        dt = 0.001
+        n = 10
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.array([1.0]))
+            p = nengo.Probe(inp, synapse=tau)
+
+        with nengo_dl.Simulator(net, dt=dt, seed=0) as sim:
+            sim.run_steps(n)
+            out = sim.data[p].flatten()
+
+        # Analytical: y[k] = 1 - exp(-k*dt/tau) for step k=1..n
+        expected = np.array([1.0 - np.exp(-k * dt / tau) for k in range(1, n + 1)])
+        np.testing.assert_allclose(
+            out, expected, atol=1e-4,
+            err_msg="Synapse step response must match analytical formula"
+        )

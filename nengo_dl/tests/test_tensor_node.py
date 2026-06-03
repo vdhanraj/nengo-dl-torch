@@ -139,6 +139,37 @@ class TestTorchNodeSimulation:
             params = sim.trainable_params()
         assert len(params) > 0
 
+    def test_callable_node_runs_callable(self):
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            node = TorchNode(lambda x: x + 1.0, size_in=1, size_out=1)
+            nengo.Connection(inp, node, synapse=None)
+            p = nengo.Probe(node, synapse=None)
+
+        x = np.array([[[2.0]]], dtype=np.float32)
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x})
+            out = sim.data[p]
+        np.testing.assert_allclose(out[0], [3.0], atol=1e-5)
+
+    def test_callable_node_pass_time(self):
+        class AddTime:
+            def __call__(self, t, x):
+                return x + t
+
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            node = TorchNode(AddTime(), size_in=1, size_out=1, pass_time=True)
+            nengo.Connection(inp, node, synapse=None)
+            p = nengo.Probe(node, synapse=None)
+
+        x = np.array([[1.0], [1.0]], dtype=np.float32)
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            sim.run_steps(2, data={inp: x})
+            out = sim.data[p]
+
+        np.testing.assert_allclose(out[:, 0], [1.001, 1.002], atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # Layer API

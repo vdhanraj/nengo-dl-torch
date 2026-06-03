@@ -154,16 +154,60 @@ class TestConverterLayers:
         with pytest.raises(ConversionError):
             Converter(model, allow_fallback=False)
 
-    def test_conv2d_uses_fallback_and_warns(self):
-        """Conv2d routes through the fallback path and emits a warning."""
-        model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.Flatten(), nn.Linear(4, 2))
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            c = Converter(model)  # allow_fallback=True by default
-        assert isinstance(c.net, nengo.Network), "Conv2d fallback should produce a valid Network"
-        assert any("not natively supported" in str(warning.message) for warning in w), (
-            "Conv2d via fallback should emit a warning"
+    def test_converts_conv2d(self):
+        """Conv2d converts with explicit input_shape."""
+        model = nn.Sequential(
+            nn.Conv2d(1, 4, 3),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(4 * 26 * 26, 2),
         )
+        c = Converter(model, input_shape=(1, 28, 28))
+        assert isinstance(c.net, nengo.Network)
+
+        inp = list(c.inputs.values())[0]
+        relu = c.outputs[model[1]]
+        sample = np.arange(0, relu.size_in, max(1, relu.size_in // 10))[:10]
+        with c.net:
+            p = nengo.Probe(relu[sample])
+
+        x = np.zeros((1, 1, 28 * 28), dtype=np.float32)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x}, inference_mode="rate")
+            assert sim.data[p].shape == (1, 10)
+
+    def test_conv2d_requires_input_shape(self):
+        """A spatial first layer needs input_shape metadata."""
+        model = nn.Sequential(nn.Conv2d(1, 4, 3))
+        with pytest.raises(ConversionError):
+            Converter(model)
+
+    def test_conv2d_rate_matches_pytorch(self):
+        """Conv2d + ReLU + Linear rate output matches PyTorch."""
+        torch.manual_seed(3)
+        model = nn.Sequential(
+            nn.Conv2d(1, 2, 3),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(2 * 2 * 2, 3),
+        )
+        model.eval()
+        x = np.random.RandomState(4).randn(1, 1, 4, 4).astype(np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x)).numpy()
+
+        c = Converter(model, input_shape=(1, 4, 4), scale_firing_rates=1)
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0:1]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -378,14 +422,11 @@ class TestConverterNumerical:
 
 
 # ---------------------------------------------------------------------------
-# Reference comparison: rate-mode Nengo output == PyTorch relu output
+# Reference comparison: rate-mode Nengo output == PyTorch output
 # ---------------------------------------------------------------------------
 
 class TestConverterRateModeReference:
-    """Rate-mode converted network must reproduce the PyTorch model's output
-    exactly (up to floating-point tolerance) for all positive pre-activations,
-    and zero for all negative ones.
-    """
+    """Rate-mode converted network must reproduce PyTorch outputs."""
 
     def _pos_linear(self, in_size=4, out_size=3, seed=7):
         torch.manual_seed(seed)
@@ -397,7 +438,7 @@ class TestConverterRateModeReference:
         return m
 
     def test_rate_mode_matches_pytorch_no_scale(self):
-        """scale_firing_rates=None: Nengo rate output == relu(W@x+b)."""
+        """scale_firing_rates=None: Nengo rate output matches PyTorch."""
         model = self._pos_linear()
         x_np = np.abs(np.random.RandomState(0).randn(4)).astype(np.float32)
         nengo_out, pt_out = _run_converter(model, x_np, scale=None)
@@ -405,7 +446,7 @@ class TestConverterRateModeReference:
                                    err_msg="Rate-mode (scale=None) must match PyTorch")
 
     def test_rate_mode_matches_pytorch_scale_10(self):
-        """scale_firing_rates=10: rate-mode output still == relu(W@x+b)."""
+        """scale_firing_rates=10: rate-mode output still matches PyTorch."""
         model = self._pos_linear()
         x_np = np.abs(np.random.RandomState(1).randn(4)).astype(np.float32)
         nengo_out, pt_out = _run_converter(model, x_np, scale=10.0)
@@ -413,15 +454,15 @@ class TestConverterRateModeReference:
                                    err_msg="Rate-mode (scale=10) must match PyTorch")
 
     def test_rate_mode_matches_pytorch_scale_500(self):
-        """scale_firing_rates=500: rate-mode output still == relu(W@x+b)."""
+        """scale_firing_rates=500: rate-mode output still matches PyTorch."""
         model = self._pos_linear()
         x_np = np.abs(np.random.RandomState(2).randn(4)).astype(np.float32)
         nengo_out, pt_out = _run_converter(model, x_np, scale=500.0)
         np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-2, atol=1e-2,
                                    err_msg="Rate-mode (scale=500) must match PyTorch")
 
-    def test_negative_inputs_give_zero_output(self):
-        """Strongly negative inputs must produce zero output (ReLU clamping)."""
+    def test_bare_linear_preserves_negative_output(self):
+        """A bare Linear layer stays linear; ReLU is an explicit layer."""
         torch.manual_seed(42)
         model = nn.Linear(3, 2, bias=True)
         with torch.no_grad():
@@ -430,24 +471,22 @@ class TestConverterRateModeReference:
         model.eval()
         x_np = np.zeros(3, dtype=np.float32)  # zero input → J = bias = -20
 
-        nengo_out, _ = _run_converter(model, x_np, scale=None)
-        np.testing.assert_allclose(nengo_out, np.zeros(2), atol=1e-5,
-                                   err_msg="Strongly subthreshold input must give zero output")
+        nengo_out, pt_out = _run_converter(model, x_np, scale=None)
+        np.testing.assert_allclose(nengo_out, pt_out, atol=1e-5)
 
     def test_relu_matches_pytorch_relu(self):
-        """For mixed-sign outputs, Nengo output == np.maximum(0, pytorch_output)."""
+        """For Linear+ReLU, Nengo output equals PyTorch ReLU output."""
         torch.manual_seed(99)
-        model = nn.Linear(5, 4, bias=True)
+        model = nn.Sequential(nn.Linear(5, 4, bias=True), nn.ReLU())
         model.eval()
         x_np = np.random.RandomState(3).randn(5).astype(np.float32)
 
         with torch.no_grad():
-            pt_linear = model(torch.tensor(x_np)).numpy()
-        expected = np.maximum(0.0, pt_linear)
+            expected = model(torch.tensor(x_np)).numpy()
 
         nengo_out, _ = _run_converter(model, x_np, scale=None)
         np.testing.assert_allclose(nengo_out, expected, rtol=1e-4, atol=1e-4,
-                                   err_msg="Nengo rate output must equal relu(W@x+b)")
+                                   err_msg="Nengo rate output must equal PyTorch ReLU output")
 
     def test_known_weights_exact_output(self):
         """Hand-crafted weights: verify exact numerical output."""
@@ -469,17 +508,17 @@ class TestConverterRateModeReference:
                 err_msg=f"Known-weight test failed for scale={scale}"
             )
 
-    def test_known_weights_negative_output_zero(self):
-        """W = -I, b = 0, x = [1, 1]: relu(W@x+b) = relu([-1,-1]) = [0,0]."""
-        model = nn.Linear(2, 2, bias=False)
+    def test_known_weights_relu_negative_output_zero(self):
+        """W = -I, b = 0, x = [1, 1]: ReLU([-1,-1]) = [0,0]."""
+        model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.ReLU())
         with torch.no_grad():
-            model.weight.data = -torch.eye(2)
+            model[0].weight.data = -torch.eye(2)
         model.eval()
 
         x_np = np.array([1.0, 1.0], dtype=np.float32)
         nengo_out, _ = _run_converter(model, x_np, scale=None)
         np.testing.assert_allclose(nengo_out, np.zeros(2), atol=1e-5,
-                                   err_msg="relu([-1,-1]) must be [0,0]")
+                                   err_msg="ReLU([-1,-1]) must be [0,0]")
 
     def test_two_layer_mlp_rate_matches_pytorch(self):
         """Two-layer MLP: rate-mode Nengo equals relu(W2 @ relu(W1@x+b1) + b2)."""
@@ -562,7 +601,7 @@ class TestConverterRateModeReference:
 class TestConverterSpikingMode:
     def test_spiking_output_is_nonnegative(self):
         """Spiking output (spike count / dt) must be non-negative."""
-        model = nn.Linear(4, 3)
+        model = nn.Sequential(nn.Linear(4, 3), nn.ReLU())
         model.eval()
         c = Converter(model, scale_firing_rates=500.0, activation_type="spiking_relu")
         inp = list(c.inputs.values())[0]
@@ -579,10 +618,10 @@ class TestConverterSpikingMode:
     def test_spiking_output_differs_from_rate_output(self):
         """A single-step spiking run differs from rate run (discrete vs continuous)."""
         torch.manual_seed(0)
-        model = nn.Linear(4, 8, bias=True)
+        model = nn.Sequential(nn.Linear(4, 8, bias=True), nn.ReLU())
         with torch.no_grad():
-            model.weight.data.fill_(0.5)
-            model.bias.data.fill_(0.5)
+            model[0].weight.data.fill_(0.5)
+            model[0].bias.data.fill_(0.5)
         model.eval()
 
         x_np = np.ones((1, 1, 4), dtype=np.float32) * 2.0
@@ -608,10 +647,10 @@ class TestConverterSpikingMode:
     def test_spiking_multistep_average_approaches_rate(self):
         """Average spiking output over many steps approaches rate output."""
         torch.manual_seed(0)
-        model = nn.Linear(3, 2, bias=True)
+        model = nn.Sequential(nn.Linear(3, 2, bias=True), nn.ReLU())
         with torch.no_grad():
-            model.weight.data = torch.eye(2, 3)
-            model.bias.data.fill_(0.3)  # ensures firing
+            model[0].weight.data = torch.eye(2, 3)
+            model[0].bias.data.fill_(0.3)  # ensures firing
         model.eval()
 
         n_steps = 500
@@ -638,3 +677,200 @@ class TestConverterSpikingMode:
             spike_mean, rate_out[0], rtol=0.2, atol=0.2,
             err_msg="Mean spiking output should approximate rate output over many steps"
         )
+
+
+# ---------------------------------------------------------------------------
+# Layer coverage: Flatten, BatchNorm, MaxPool, nested Sequential, bias=False
+# ---------------------------------------------------------------------------
+
+class TestConverterLayerCoverage:
+    def test_flatten_linear_exact_output(self):
+        """Flatten (no-op in Nengo) + Linear: output matches PyTorch exactly."""
+        model = nn.Sequential(nn.Flatten(start_dim=0), nn.Linear(4, 2, bias=False))
+        with torch.no_grad():
+            model[1].weight.data = torch.tensor(
+                [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
+            )
+        model.eval()
+
+        x_np = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np)).numpy()  # [1, 5]
+
+        c = Converter(model, activation_type="rectified_linear")
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, atol=1e-4,
+                                   err_msg="Flatten+Linear output must match PyTorch")
+
+    def test_linear_bias_false_exact_output(self):
+        """nn.Linear with bias=False converts correctly; output = W@x."""
+        W = np.array([[2.0, 0.0], [0.0, 3.0]], dtype=np.float32)
+        model = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            model.weight.data = torch.tensor(W)
+        model.eval()
+
+        x_np = np.array([1.0, 2.0], dtype=np.float32)
+        expected = np.maximum(0.0, W @ x_np)  # relu(W@x) = [2, 6]
+
+        c = Converter(model, activation_type="rectified_linear")
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, expected, atol=1e-4,
+                                   err_msg=f"bias=False output must equal relu(W@x)={expected}")
+
+    def test_batchnorm_uses_fallback_and_warns(self):
+        """BatchNorm1d is not natively converted; it uses the fallback and warns."""
+        model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4))
+        model.eval()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            c = Converter(model)
+
+        assert isinstance(c.net, nengo.Network), "BatchNorm fallback must produce a valid Network"
+        assert any("not natively supported" in str(warning.message) for warning in w), (
+            "BatchNorm must warn about fallback conversion"
+        )
+
+    def test_maxpool_uses_fallback_and_warns(self):
+        """MaxPool1d is not natively converted; it uses the fallback and warns."""
+        model = nn.Sequential(nn.Linear(4, 4), nn.MaxPool1d(2))
+        model.eval()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            c = Converter(model)
+
+        assert isinstance(c.net, nengo.Network), "MaxPool fallback must produce a valid Network"
+        assert any("not natively supported" in str(warning.message) for warning in w)
+
+    def test_three_layer_chain_argmax_matches_pytorch(self):
+        """3-layer Linear→ReLU→Linear→ReLU→Linear: rate-mode argmax matches PyTorch."""
+        torch.manual_seed(55)
+        model = nn.Sequential(
+            nn.Linear(4, 6, bias=True),
+            nn.ReLU(),
+            nn.Linear(6, 4, bias=True),
+            nn.ReLU(),
+            nn.Linear(4, 3, bias=True),
+        )
+        with torch.no_grad():
+            for m in model.modules():
+                if isinstance(m, nn.Linear):
+                    m.weight.data.abs_()
+                    m.bias.data.fill_(0.3)
+        model.eval()
+
+        x_np = np.abs(np.random.RandomState(7).randn(4)).astype(np.float32)
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np)).numpy()
+
+        c = Converter(model, scale_firing_rates=300.0, synapse=None)
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        assert np.argmax(nengo_out) == np.argmax(pt_out), (
+            f"3-layer chain: argmax mismatch — pytorch={np.argmax(pt_out)}, nengo={np.argmax(nengo_out)}"
+        )
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=0.05, atol=0.05,
+                                   err_msg="3-layer chain rate-mode output must closely match PyTorch")
+
+    def test_eval_mode_required_for_batchnorm_consistency(self):
+        """BatchNorm in eval mode gives consistent output; train mode uses batch stats."""
+        model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4))
+        x = torch.ones(8, 4)
+
+        model.train()
+        # Running stats are not updated in train mode unless we call model(x)
+        with torch.no_grad():
+            train_out = model(x).numpy()
+
+        model.eval()
+        with torch.no_grad():
+            eval_out = model(x).numpy()
+
+        # In train mode, BatchNorm normalises using the batch — mean ≈ 0 for constant input
+        # In eval mode, it uses running stats (initialised to mean=0, var=1)
+        # The results may or may not differ depending on running-stat initialisation,
+        # but at minimum the eval-mode output must be finite and consistent.
+        assert np.all(np.isfinite(eval_out)), "BatchNorm eval output must be finite"
+        # Calling model a second time in eval mode must give the same result
+        with torch.no_grad():
+            eval_out2 = model(x).numpy()
+        np.testing.assert_allclose(eval_out, eval_out2, atol=1e-6,
+                                   err_msg="BatchNorm eval mode must be deterministic")
+
+
+# ---------------------------------------------------------------------------
+# set_weights strict-mode coverage
+# ---------------------------------------------------------------------------
+
+class TestSetWeightsStrict:
+    def test_unknown_key_raises(self):
+        """set_weights with an unknown key raises ValueError (strict=True default)."""
+        model = _make_mlp(in_size=4, hidden=8, out_size=3)
+        c = Converter(model)
+        inp = list(c.inputs.values())[0]
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            with pytest.raises(ValueError, match="Unknown weight keys"):
+                sim.set_weights({"definitely_not_a_real_key": np.zeros(3)})
+
+    def test_valid_keys_accepted(self):
+        """set_weights with all valid keys (from get_weights) must not raise."""
+        model = _make_mlp()
+        c = Converter(model)
+        inp = list(c.inputs.values())[0]
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            w = sim.get_weights()
+            sim.set_weights(w)  # exact same keys — must not raise
+
+    def test_converted_weights_transferable(self):
+        """Weights from one converted-model sim transfer to another identical sim."""
+        model = _make_mlp(in_size=4, hidden=8, out_size=3)
+        c1 = Converter(model)
+        c2 = Converter(model)
+
+        inp1 = list(c1.inputs.values())[0]
+        out1 = list(c1.outputs.values())[-1]
+        inp2 = list(c2.inputs.values())[0]
+        out2 = list(c2.outputs.values())[-1]
+        with c1.net:
+            p1 = nengo.Probe(out1, synapse=None)
+        with c2.net:
+            p2 = nengo.Probe(out2, synapse=None)
+
+        x = np.ones((1, 1, 4), dtype=np.float32)
+
+        with nengo_dl.Simulator(c1.net, seed=0) as sim1:
+            w1 = sim1.get_weights()
+            sim1.run_steps(1, data={inp1: x}, inference_mode="rate")
+            out_before = sim1.data[p1][0].copy()
+
+        with nengo_dl.Simulator(c2.net, seed=99) as sim2:
+            sim2.set_weights(w1)  # load trained weights
+            sim2.run_steps(1, data={inp2: x}, inference_mode="rate")
+            out_after = sim2.data[p2][0].copy()
+
+        np.testing.assert_allclose(out_before, out_after, atol=1e-4,
+                                   err_msg="Transferred weights must reproduce same output")

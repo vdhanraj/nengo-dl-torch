@@ -73,17 +73,33 @@ class CopyBuilder(OpBuilder):
     """Copies one signal to another (with optional slicing/reshaping)."""
 
     def build_pre(self, ops, signals, config):
-        self._copies = [(op.src, op.dst, op.inc) for op in ops]
+        self._copies = [
+            (op.src, op.dst, op.inc, op.src_slice, op.dst_slice)
+            for op in ops
+        ]
 
     def build_step(self, ops, signals, config):
-        for src, dst, inc in self._copies:
+        for src, dst, inc, src_slice, dst_slice in self._copies:
             val = signals.gather(src)
+            if src_slice is not None:
+                val = val[:, src_slice]
             # Reshape to destination shape if needed
-            if val.shape[1:] != dst.shape:
+            target_shape = (
+                dst_slice.shape if hasattr(dst_slice, "shape") else dst.shape
+            )
+            if dst_slice is None and val.shape[1:] != target_shape:
                 batch = val.shape[0] if val.dim() > len(src.shape) else 1
-                val = val.reshape(batch, *dst.shape)
-            mode = "inc" if inc else "set"
-            signals.scatter(dst, val, mode=mode)
+                val = val.reshape(batch, *target_shape)
+            if dst_slice is not None:
+                cur = signals.gather(dst).clone()
+                if inc:
+                    cur[:, dst_slice] = cur[:, dst_slice] + val
+                else:
+                    cur[:, dst_slice] = val
+                signals.scatter(dst, cur, mode="set")
+            else:
+                mode = "inc" if inc else "set"
+                signals.scatter(dst, val, mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -219,23 +235,26 @@ class SimPyFuncBuilder(OpBuilder):
 
             if x_sig is not None:
                 x_tensor = signals.gather(x_sig)
-                # Use only the first batch item for the function call
-                x_np = x_tensor[0].detach().cpu().numpy()
-                result = fn(t, x_np)
+                x_np = x_tensor.detach().cpu().numpy()
+                results = []
+                for b in range(config.minibatch_size):
+                    result = fn(t, x_np[b])
+                    if result is None:
+                        results.append(np.zeros(out_sig.shape, dtype=np.float32))
+                    else:
+                        results.append(np.asarray(result, dtype=np.float32))
+                result_np = np.stack(results, axis=0)
             else:
-                result = fn(t)
+                results = []
+                for _ in range(config.minibatch_size):
+                    result = fn(t)
+                    if result is None:
+                        results.append(np.zeros(out_sig.shape, dtype=np.float32))
+                    else:
+                        results.append(np.asarray(result, dtype=np.float32))
+                result_np = np.stack(results, axis=0)
 
-            if result is None:
-                continue
-
-            result_np = np.asarray(result, dtype=np.float32)
-            result_t = torch.tensor(
-                result_np, dtype=config.dtype, device=config.device
-            )
-            # Broadcast across batch
-            result_t = result_t.unsqueeze(0).expand(
-                config.minibatch_size, *result_t.shape
-            )
+            result_t = torch.tensor(result_np, dtype=config.dtype, device=config.device)
             signals.scatter(out_sig, result_t, mode="set")
 
 

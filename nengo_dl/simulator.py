@@ -290,23 +290,23 @@ class Simulator:
         """
         show_pbar = self.progress_bar if progress_bar is None else progress_bar
         rate_mode = _inference_mode_to_rate(inference_mode)
+        data = _normalize_data_dict(data, n_steps=n_steps)
 
         # Determine if data has more samples than minibatch_size and needs chunking.
-        n_total = None
-        if data is not None:
-            for v in data.values():
-                arr = np.asarray(v) if not isinstance(v, np.ndarray) else v
-                if arr.ndim == 3:
-                    n_total = arr.shape[0]
-                    break
+        n_total = _count_samples(data, None)
+
+        if n_total is not None and n_total > 0:
+            if n_total < self.minibatch_size or n_total % self.minibatch_size != 0:
+                raise ValueError(
+                    f"Input sample count ({n_total}) must be divisible by "
+                    f"minibatch_size ({self.minibatch_size})."
+                )
 
         if n_total is not None and n_total > self.minibatch_size:
             # Process in minibatch_size chunks and concatenate probe results.
             chunk_results: Dict = {}
             for start in range(0, n_total, self.minibatch_size):
                 end = min(start + self.minibatch_size, n_total)
-                if end - start < self.minibatch_size:
-                    break  # skip incomplete final batch
                 batch_data = {k: np.asarray(v)[start:end] for k, v in data.items()}
                 if not stateful:
                     self.tensor_graph.reset_state()
@@ -511,9 +511,15 @@ class Simulator:
             )
 
         bs = batch_size if batch_size is not None else self.minibatch_size
+        x = _normalize_data_dict(x, n_steps=n_steps)
+        y = _normalize_data_dict(y, n_steps=n_steps)
 
         # Determine sample count
         n_samples = _count_samples(x, y)
+        if n_samples < bs or n_samples % bs != 0:
+            raise ValueError(
+                f"Sample count ({n_samples}) must be divisible by batch_size ({bs})."
+            )
 
         # Validation split
         val_idx = int(n_samples * (1 - validation_split))
@@ -533,10 +539,6 @@ class Simulator:
                 end = min(start + bs, n_train)
                 idx = perm[start:end]
                 cur_bs = len(idx)
-
-                # Skip incomplete batches (batch size must match minibatch_size)
-                if cur_bs < bs:
-                    continue
 
                 batch_x = _index_data(train_x, idx)
                 batch_y = _index_data(train_y, idx)
@@ -592,9 +594,7 @@ class Simulator:
                 continue
             if not isinstance(target, torch.Tensor):
                 target = _to_tensor(target, self.tensor_graph.dtype, self.tensor_graph.device)
-            # Ensure target has batch dimension
-            if target.dim() == pred.dim() - 1:
-                target = target.unsqueeze(0).expand_as(pred)
+            target = _align_target_to_pred(target, pred)
             weight = 1.0
             if self._loss_weights:
                 weight = self._loss_weights.get(probe, 1.0)
@@ -613,8 +613,14 @@ class Simulator:
     ):
         """Compute validation loss without gradients."""
         losses = []
+        val_x = _normalize_data_dict(val_x, n_steps=n_steps)
+        val_y = _normalize_data_dict(val_y, n_steps=n_steps)
         n_val = _count_samples(val_x, val_y)
         rate_mode = _inference_mode_to_rate(inference_mode)
+        if n_val > 0 and (n_val < bs or n_val % bs != 0):
+            raise ValueError(
+                f"Validation sample count ({n_val}) must be divisible by batch_size ({bs})."
+            )
         with torch.no_grad():
             for start in range(0, n_val, bs):
                 end = min(start + bs, n_val)
@@ -795,7 +801,7 @@ class Simulator:
         if not os.path.exists(path) and not path.endswith(".npz"):
             path = path + ".npz"
         data = np.load(path, allow_pickle=False)
-        self.tensor_graph.set_weights(dict(data))
+        self.tensor_graph.set_weights(dict(data), strict=False)
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -910,13 +916,48 @@ def _inference_mode_to_rate(inference_mode):
 
 def _count_samples(x, y):
     """Count number of samples from input/target dicts."""
-    data = x or y
+    counts = []
+    for data in (x, y):
+        if not data:
+            continue
+        for v in data.values():
+            if isinstance(v, (np.ndarray, torch.Tensor)):
+                counts.append(v.shape[0])
+        if counts and len(set(counts)) != 1:
+            raise ValueError(f"Inconsistent sample counts in data: {sorted(set(counts))}")
+    if x and y and counts:
+        x_count = next(v.shape[0] for v in x.values() if isinstance(v, (np.ndarray, torch.Tensor)))
+        y_count = next(v.shape[0] for v in y.values() if isinstance(v, (np.ndarray, torch.Tensor)))
+        if x_count != y_count:
+            raise ValueError(f"Input and target sample counts differ: {x_count} vs {y_count}")
+    return counts[0] if counts else 0
+
+
+def _normalize_data_dict(data, n_steps=None):
+    """Canonicalize arrays/tensors to ``(samples, n_steps, ...)`` form."""
     if not data:
-        return 0
-    for v in data.values():
-        if isinstance(v, (np.ndarray, torch.Tensor)):
-            return v.shape[0]
-    return 0
+        return data
+
+    normalized = {}
+    for k, v in data.items():
+        if isinstance(v, np.ndarray):
+            arr = v
+            if arr.ndim == 1:
+                arr = arr.reshape(1, 1, *arr.shape)
+            elif arr.ndim == 2:
+                arr = arr[np.newaxis, ...]
+            normalized[k] = arr
+        elif isinstance(v, torch.Tensor):
+            arr = v
+            if arr.dim() == 1:
+                arr = arr.reshape(1, 1, *arr.shape)
+            elif arr.dim() == 2:
+                arr = arr.unsqueeze(0)
+            normalized[k] = arr
+        else:
+            normalized[k] = v
+
+    return normalized
 
 
 def _split_data(data, idx):
@@ -936,3 +977,27 @@ def _index_data(data, idx):
         k: v[idx] if isinstance(v, (np.ndarray, torch.Tensor)) else v
         for k, v in data.items()
     }
+
+
+def _align_target_to_pred(target, pred):
+    """Expand singleton batch/time dimensions in targets to match predictions."""
+    while target.dim() < pred.dim():
+        target = target.unsqueeze(0)
+
+    if target.shape[0] == 1 and pred.shape[0] != 1:
+        expand_shape = list(target.shape)
+        expand_shape[0] = pred.shape[0]
+        target = target.expand(*expand_shape)
+
+    if target.shape[1] == 1 and pred.shape[1] != 1:
+        expand_shape = list(target.shape)
+        expand_shape[1] = pred.shape[1]
+        target = target.expand(*expand_shape)
+
+    if target.shape != pred.shape:
+        raise ValueError(
+            f"Target shape {tuple(target.shape)} is incompatible with prediction "
+            f"shape {tuple(pred.shape)}."
+        )
+
+    return target

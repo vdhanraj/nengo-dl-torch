@@ -75,6 +75,8 @@ def test_nengo_version_no_warning_on_compatible():
     """If nengo is a release version, no version warning should be emitted."""
     if nengo_version.dev is not None:
         pytest.skip("nengo is a development version; skip warning-clean check")
-    with pytest.warns(None) as rec:
+    import warnings
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
         reload(version)
     assert len(rec) == 0

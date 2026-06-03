@@ -363,8 +363,19 @@ class TensorGraph(nn.Module):
 
         return weights
 
-    def set_weights(self, weights: Dict[str, np.ndarray]):
+    def set_weights(self, weights: Dict[str, np.ndarray], strict: bool = True):
         """Set trainable parameters from a dict of numpy arrays."""
+        if strict:
+            # Collect all known keys
+            known_keys = set(self._param_dict.keys())
+            for idx, module in enumerate(self._torch_modules):
+                prefix = f"torch_module_{idx:04d}."
+                for name in module.state_dict().keys():
+                    known_keys.add(prefix + name)
+            unknown = set(weights.keys()) - known_keys
+            if unknown:
+                raise ValueError(f"Unknown weight keys: {sorted(unknown)}")
+
         for name, val in weights.items():
             if name in self._param_dict:
                 with torch.no_grad():

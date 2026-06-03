@@ -1,4 +1,4 @@
-"""TorchNode: embed arbitrary PyTorch modules inside a Nengo network.
+"""TorchNode: embed arbitrary PyTorch modules or callables inside a Nengo network.
 
 Analogous to NengoDL's ``TensorNode`` but using PyTorch ``nn.Module``
 instead of Keras layers. Supports gradient flow through layers during training.
@@ -170,10 +170,18 @@ class _SpatialModule(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, flat_in)
         batch = x.shape[0]
-        # Reshape to spatial: assume shape_in = (H, W, C) → NCHW for PyTorch
+        # Reshape to spatial.  Prefer CHW when it matches the wrapped module,
+        # but also accept HWC for caller convenience.
         if len(self.shape_in) == 3:
-            h, w, c = self.shape_in
-            x_spatial = x.reshape(batch, h, w, c).permute(0, 3, 1, 2)  # NHWC → NCHW
+            if (
+                hasattr(self.module, "in_channels")
+                and self.shape_in[0] == self.module.in_channels
+            ):
+                c, h, w = self.shape_in
+                x_spatial = x.reshape(batch, c, h, w)
+            else:
+                h, w, c = self.shape_in
+                x_spatial = x.reshape(batch, h, w, c).permute(0, 3, 1, 2)
         elif len(self.shape_in) == 2:
             h, w = self.shape_in
             x_spatial = x.reshape(batch, 1, h, w)
@@ -182,7 +190,6 @@ class _SpatialModule(nn.Module):
 
         out = self.module(x_spatial)
 
-        # Flatten output: NCHW → N*(C*H*W)
         return out.reshape(batch, -1)
 
 
@@ -197,10 +204,12 @@ class SimTorchNode(Operator):
     PyTorch tensors, enabling gradient flow through the module.
     """
 
-    def __init__(self, node, module, output, input=None, t=None, tag=None):
+    def __init__(self, node, module, func, pass_time, output, input=None, t=None, tag=None):
         super().__init__(tag=tag)
         self.node = node
         self.module = module  # nn.Module to execute (may be None)
+        self.func = func
+        self.pass_time = pass_time
         self._input = input
         self._output = output
         self._t = t
@@ -222,6 +231,21 @@ class SimTorchNode(Operator):
 class SimTorchNodeBuilder(OpBuilder):
     """Executes TorchNode operators using PyTorch tensors with gradient flow."""
 
+    @staticmethod
+    def _call_target(target, pass_time, t, x):
+        if target is None:
+            return x
+
+        if x is None:
+            out = target(t) if pass_time else target()
+        else:
+            out = target(t, x) if pass_time else target(x)
+
+        if isinstance(out, torch.Tensor):
+            return out
+
+        return torch.as_tensor(out)
+
     def build_pre(self, ops, signals, config):
         self._op_list = []
         for op in ops:
@@ -236,6 +260,8 @@ class SimTorchNodeBuilder(OpBuilder):
                 ).to(config.device)
             self._op_list.append({
                 "module": op.module,
+                "func": op.func,
+                "pass_time": op.pass_time,
                 "smooth_module": smooth_module,
                 "input_sig": op._input,
                 "output_sig": op._output,
@@ -256,9 +282,9 @@ class SimTorchNodeBuilder(OpBuilder):
                 and config.lif_smoothing > 0
                 and smooth is not None
             ):
-                module = smooth
+                target = smooth
             else:
-                module = op_info["module"]
+                target = op_info["module"] or op_info["func"]
 
             t_val = signals.gather(t_sig)
             t = float(t_val.flatten()[0].item())
@@ -270,18 +296,9 @@ class SimTorchNodeBuilder(OpBuilder):
                 if x.dim() > 2:
                     x = x.reshape(batch, -1)
 
-                if module is not None:
-                    out = module(x)
-                else:
-                    out = x
+                out = self._call_target(target, op_info["pass_time"], t, x)
             else:
-                if module is not None:
-                    # Source module: call with no input
-                    dummy = torch.zeros(config.minibatch_size, 1,
-                                       dtype=config.dtype, device=config.device)
-                    out = module(dummy)
-                else:
-                    continue
+                out = self._call_target(target, op_info["pass_time"], t, None)
 
             # out: (batch, flat_out) - scatter to output signal
             signals.scatter(out_sig, out.to(config.dtype), mode="set")
@@ -399,11 +416,14 @@ def build_torch_node(model, node):
 
     # Determine the module to execute
     module = node._module
+    func = node.torch_func
 
     # Create the SimTorchNode operator
     torch_op = SimTorchNode(
         node=node,
         module=module,
+        func=func,
+        pass_time=node.pass_time,
         output=out_sig,
         input=x_sig,
         t=t_sig,
