@@ -36,6 +36,11 @@ class SimProcessBuilder(OpBuilder):
     def _build_process(self, op, process, signals, config):
         dt = config.dt
         if isinstance(process, nengo.synapses.Lowpass):
+            if process.tau <= 0:
+                return {
+                    "type": "passthrough",
+                    "op": op,
+                }
             alpha = float(np.exp(-dt / process.tau))
             return {
                 "type": "lowpass",
@@ -99,12 +104,20 @@ class SimProcessBuilder(OpBuilder):
 
             if ptype == "lowpass":
                 self._lowpass_step(step_info, signals, config)
+            elif ptype == "passthrough":
+                self._passthrough_step(step_info, signals, config)
             elif ptype == "alpha":
                 self._alpha_step(step_info, signals, config)
             elif ptype == "linear_filter":
                 self._linear_filter_step(step_info, signals, config)
             elif ptype == "numpy":
                 self._numpy_step(step_info, signals, config)
+
+    def _passthrough_step(self, step_info, signals, config):
+        """Directly copy the input for zero-tau filters."""
+        op = step_info["op"]
+        x = signals.gather(op.input).to(config.dtype)
+        signals.scatter(op.output, x, mode="set")
 
     def _lowpass_step(self, step_info, signals, config):
         """First-order IIR filter: y[t] = alpha*y[t-1] + (1-alpha)*x[t]."""

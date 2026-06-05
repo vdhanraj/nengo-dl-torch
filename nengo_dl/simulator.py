@@ -115,7 +115,10 @@ class SimulationData:
     def __contains__(self, key):
         if isinstance(key, nengo.Probe):
             return key in self._probe_data
-        return True  # optimistic: params always accessible
+        if isinstance(key, (nengo.Ensemble, nengo.Connection, nengo.ensemble.Neurons)):
+            model = self._sim._model
+            return key in model.sig or key in model.params
+        return False
 
     def __repr__(self):
         return f"SimulationData(probes={list(self._probe_data.keys())})"
@@ -218,6 +221,7 @@ class Simulator:
         self._loss_fns: Dict[nengo.Probe, Callable] = {}
         self._loss_weights: Optional[Dict[nengo.Probe, float]] = None
         self._stateful = False
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Context manager support
@@ -232,7 +236,84 @@ class Simulator:
 
     def close(self):
         """Release resources."""
-        pass
+        if self._closed:
+            return
+        self._closed = True
+
+    def _ensure_open(self):
+        if self._closed:
+            raise RuntimeError("Simulator is closed.")
+
+    def _progress(self, iterable, enabled: bool, **kwargs):
+        if not enabled:
+            return iterable
+
+        try:
+            from tqdm.auto import tqdm
+
+            return tqdm(iterable, **kwargs)
+        except Exception:
+            return iterable
+
+    def _run_inference_batches(
+        self,
+        n_steps: int,
+        data,
+        stateful: bool,
+        rate_mode: bool,
+        progress_bar: bool = False,
+        desc: str = "run",
+    ):
+        """Run inference and return probe tensors with sample batching."""
+        n_total = _count_samples(data, None)
+
+        if n_total is not None and n_total > 0:
+            if n_total < self.minibatch_size or n_total % self.minibatch_size != 0:
+                raise ValueError(
+                    f"Input sample count ({n_total}) must be divisible by "
+                    f"minibatch_size ({self.minibatch_size})."
+                )
+
+        if n_total is not None and n_total > self.minibatch_size:
+            chunk_results: Dict = {}
+            starts = range(0, n_total, self.minibatch_size)
+            starts = self._progress(
+                starts,
+                progress_bar,
+                total=n_total // self.minibatch_size,
+                desc=desc,
+                leave=False,
+            )
+            for start in starts:
+                end = min(start + self.minibatch_size, n_total)
+                batch_data = {k: np.asarray(v)[start:end] for k, v in data.items()}
+                if not stateful:
+                    self.tensor_graph.reset_state()
+                with torch.no_grad():
+                    batch_results = self.tensor_graph.forward(
+                        n_steps=n_steps,
+                        input_data=batch_data,
+                        training=False,
+                        rate_mode=rate_mode,
+                    )
+                for probe, tensor in batch_results.items():
+                    chunk_results.setdefault(probe, []).append(tensor.cpu())
+
+            return {
+                probe: torch.cat(tensors, dim=0)
+                for probe, tensors in chunk_results.items()
+            }
+
+        if not stateful:
+            self.tensor_graph.reset_state()
+
+        with torch.no_grad():
+            return self.tensor_graph.forward(
+                n_steps=n_steps,
+                input_data=data,
+                training=False,
+                rate_mode=rate_mode,
+            )
 
     # ------------------------------------------------------------------
     # Running simulations
@@ -255,6 +336,7 @@ class Simulator:
             If ``"spiking"``, spiking neurons emit discrete spikes. If
             ``"rate"``, spiking neurons use their rate approximation.
         """
+        self._ensure_open()
         n_steps = int(np.round(time_in_seconds / self.dt))
         self.run_steps(
             n_steps,
@@ -288,54 +370,20 @@ class Simulator:
             If ``"spiking"``, spiking neurons emit discrete spikes. If
             ``"rate"``, spiking neurons use their rate approximation.
         """
+        self._ensure_open()
         show_pbar = self.progress_bar if progress_bar is None else progress_bar
         rate_mode = _inference_mode_to_rate(inference_mode)
         data = _normalize_data_dict(data, n_steps=n_steps)
-
-        # Determine if data has more samples than minibatch_size and needs chunking.
-        n_total = _count_samples(data, None)
-
-        if n_total is not None and n_total > 0:
-            if n_total < self.minibatch_size or n_total % self.minibatch_size != 0:
-                raise ValueError(
-                    f"Input sample count ({n_total}) must be divisible by "
-                    f"minibatch_size ({self.minibatch_size})."
-                )
-
-        if n_total is not None and n_total > self.minibatch_size:
-            # Process in minibatch_size chunks and concatenate probe results.
-            chunk_results: Dict = {}
-            for start in range(0, n_total, self.minibatch_size):
-                end = min(start + self.minibatch_size, n_total)
-                batch_data = {k: np.asarray(v)[start:end] for k, v in data.items()}
-                if not stateful:
-                    self.tensor_graph.reset_state()
-                with torch.no_grad():
-                    batch_results = self.tensor_graph.forward(
-                        n_steps=n_steps,
-                        input_data=batch_data,
-                        training=False,
-                        rate_mode=rate_mode,
-                    )
-                for probe, tensor in batch_results.items():
-                    chunk_results.setdefault(probe, []).append(tensor.cpu())
-            for probe, tensors in chunk_results.items():
-                combined = torch.cat(tensors, dim=0)
-                self.data._store_probe(probe, combined)
-        else:
-            if not stateful:
-                self.tensor_graph.reset_state()
-
-            with torch.no_grad():
-                results = self.tensor_graph.forward(
-                    n_steps=n_steps,
-                    input_data=data,
-                    training=False,
-                    rate_mode=rate_mode,
-                )
-
-            for probe, tensor in results.items():
-                self.data._store_probe(probe, tensor)
+        results = self._run_inference_batches(
+            n_steps=n_steps,
+            data=data,
+            stateful=stateful,
+            rate_mode=rate_mode,
+            progress_bar=show_pbar,
+            desc="run_steps",
+        )
+        for probe, tensor in results.items():
+            self.data._store_probe(probe, tensor)
 
         # Always accumulate total step count; stateful only controls signal state
         self._n_steps += n_steps
@@ -367,12 +415,71 @@ class Simulator:
         dict
             Maps probes to numpy arrays.
         """
-        self.run_steps(
-            n_steps,
-            data=x,
-            stateful=stateful,
-            inference_mode=inference_mode,
-        )
+        self._ensure_open()
+        rate_mode = _inference_mode_to_rate(inference_mode)
+        data = _normalize_data_dict(x, n_steps=n_steps)
+
+        if batch_size is None:
+            results = self._run_inference_batches(
+                n_steps=n_steps,
+                data=data,
+                stateful=stateful,
+                rate_mode=rate_mode,
+                progress_bar=self.progress_bar,
+                desc="predict",
+            )
+        else:
+            if batch_size < self.minibatch_size:
+                raise ValueError(
+                    f"predict(batch_size={batch_size}) must be >= minibatch_size "
+                    f"({self.minibatch_size})."
+                )
+            if batch_size % self.minibatch_size != 0:
+                raise ValueError(
+                    f"predict(batch_size={batch_size}) must be divisible by "
+                    f"minibatch_size ({self.minibatch_size})."
+                )
+            n_total = _count_samples(data, None)
+            if n_total and n_total % self.minibatch_size != 0:
+                raise ValueError(
+                    f"Input sample count ({n_total}) must be divisible by "
+                    f"minibatch_size ({self.minibatch_size})."
+                )
+
+            chunk_results: Dict = {}
+            starts = range(0, n_total, batch_size) if n_total else [0]
+            starts = self._progress(
+                starts,
+                self.progress_bar,
+                total=(n_total + batch_size - 1) // batch_size if n_total else 1,
+                desc="predict",
+                leave=False,
+            )
+            for start in starts:
+                end = min(start + batch_size, n_total)
+                batch_x = (
+                    {k: np.asarray(v)[start:end] for k, v in data.items()}
+                    if n_total
+                    else data
+                )
+                batch_results = self._run_inference_batches(
+                    n_steps=n_steps,
+                    data=batch_x,
+                    stateful=stateful,
+                    rate_mode=rate_mode,
+                    progress_bar=False,
+                    desc="predict",
+                )
+                for probe, tensor in batch_results.items():
+                    chunk_results.setdefault(probe, []).append(tensor.cpu())
+
+            results = {
+                probe: torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+                for probe, tensors in chunk_results.items()
+            }
+
+        for probe, tensor in results.items():
+            self.data._store_probe(probe, tensor)
         return {p: self.data[p] for p in self._model.probes}
 
     def predict_on_batch(
@@ -413,6 +520,7 @@ class Simulator:
         loss_weights : dict, optional
             Maps probes to scalar loss weights (default 1.0 each).
         """
+        self._ensure_open()
         if isinstance(optimizer, str):
             params = self.trainable_params()
             optimizer_map = {
@@ -505,6 +613,7 @@ class Simulator:
         dict
             Training history: ``{'loss': [...], 'val_loss': [...]}``.
         """
+        self._ensure_open()
         if self._optimizer is None:
             raise RuntimeError(
                 "No optimizer set. Call sim.compile(optimizer=...) first."
@@ -654,6 +763,7 @@ class Simulator:
         dict
             ``{'loss': float}``
         """
+        self._ensure_open()
         bs = batch_size if batch_size is not None else self.minibatch_size
         val_loss = self._compute_val_loss(
             x,
@@ -670,14 +780,17 @@ class Simulator:
 
     def get_weights(self) -> Dict[str, np.ndarray]:
         """Return all trainable parameters as a dict of numpy arrays."""
+        self._ensure_open()
         return self.tensor_graph.get_weights()
 
     def set_weights(self, weights: Dict[str, np.ndarray]):
         """Set trainable parameters from a dict of numpy arrays."""
+        self._ensure_open()
         self.tensor_graph.set_weights(weights)
 
     def reset_state(self):
         """Reset all time-varying state signals to initial values."""
+        self._ensure_open()
         self.tensor_graph.reset_state()
         self._n_steps = 0
         self._last_n_steps = 0
@@ -688,6 +801,7 @@ class Simulator:
         Includes both Nengo signal parameters (weights/biases/encoders) and
         any PyTorch nn.Module parameters added via ``Layer`` / ``TorchNode``.
         """
+        self._ensure_open()
         params = list(self.tensor_graph.parameters())  # uses nn.Module.parameters()
         if not params:
             # Fallback to explicit collections
@@ -715,6 +829,7 @@ class Simulator:
         dict
             Maps objects to dicts of parameter values.
         """
+        self._ensure_open()
         model = self._model
         result = {}
 
@@ -727,14 +842,38 @@ class Simulator:
             )
 
         for obj in objects:
-            sigs = model.sig.get(obj, {})
             obj_params = {}
-            for key, sig in sigs.items():
-                try:
-                    val = self.tensor_graph.signals.gather(sig)
-                    obj_params[key] = val.detach().cpu().numpy()
-                except Exception:
-                    pass
+            if isinstance(obj, nengo.Ensemble):
+                ens_params = model.params.get(obj)
+                if ens_params is not None:
+                    for key in ("gain", "bias", "encoders", "scaled_encoders"):
+                        val = getattr(ens_params, key, None)
+                        if val is not None:
+                            obj_params[key] = np.asarray(val)
+
+                ens_sigs = model.sig.get(obj, {})
+                if "encoders" in ens_sigs:
+                    try:
+                        current = self.tensor_graph.signals.gather(ens_sigs["encoders"])
+                        obj_params["scaled_encoders"] = current.detach().cpu().numpy()
+                    except Exception:
+                        pass
+
+                neuron_sigs = model.sig.get(obj.neurons, {})
+                if "bias" in neuron_sigs:
+                    try:
+                        current = self.tensor_graph.signals.gather(neuron_sigs["bias"])
+                        obj_params["bias"] = current.detach().cpu().numpy()
+                    except Exception:
+                        pass
+            else:
+                sigs = model.sig.get(obj, {})
+                for key, sig in sigs.items():
+                    try:
+                        val = self.tensor_graph.signals.gather(sig)
+                        obj_params[key] = val.detach().cpu().numpy()
+                    except Exception:
+                        pass
             if obj_params:
                 result[obj] = obj_params
 
@@ -751,25 +890,90 @@ class Simulator:
         nengo_objects : list, optional
             Objects to freeze. If None, freezes all.
         """
+        self._ensure_open()
         params = self.get_nengo_params(nengo_objects)
         model = self._model
 
         for obj, obj_params in params.items():
             if isinstance(obj, nengo.Ensemble):
-                if "encoders" in obj_params or "scaled_encoders" in obj_params:
-                    pass  # Would need to unscale; left for advanced use
-                if "bias" in obj_params:
-                    ens_params = model.params.get(obj)
+                ens_params = model.params.get(obj)
+                gain = obj_params.get("gain")
+                bias = obj_params.get("bias")
+                scaled = obj_params.get("scaled_encoders")
+                encoders = obj_params.get("encoders")
+
+                if gain is not None:
+                    gain = np.asarray(gain)
+                    obj.gain = gain
                     if ens_params is not None:
                         try:
-                            ens_params.bias = obj_params["bias"]
+                            ens_params.gain = gain
                         except Exception:
                             pass
+
+                if bias is not None:
+                    bias = np.asarray(bias)
+                    obj.bias = bias
+                    if ens_params is not None:
+                        try:
+                            ens_params.bias = bias
+                        except Exception:
+                            pass
+
+                if scaled is not None:
+                    scaled = np.asarray(scaled)
+                    norms = np.linalg.norm(scaled, axis=1, keepdims=True)
+                    safe_norms = np.where(norms > 1e-12, norms, 1.0)
+                    encoders = scaled / safe_norms
+                    derived_gain = (safe_norms[:, 0] * obj.radius).astype(scaled.dtype, copy=False)
+
+                    if ens_params is not None and getattr(ens_params, "encoders", None) is not None:
+                        existing = np.asarray(ens_params.encoders)
+                        zero_mask = norms[:, 0] <= 1e-12
+                        if np.any(zero_mask):
+                            encoders[zero_mask] = existing[zero_mask]
+
+                    gain = derived_gain
+                    obj.gain = gain
+                    if ens_params is not None:
+                        try:
+                            ens_params.gain = gain
+                        except Exception:
+                            pass
+
+                if encoders is not None:
+                    encoders = np.asarray(encoders)
+                    obj.encoders = encoders
+                    if ens_params is not None:
+                        try:
+                            ens_params.encoders = encoders
+                        except Exception:
+                            pass
+                        if gain is not None:
+                            try:
+                                ens_params.scaled_encoders = encoders * (
+                                    np.asarray(gain)[:, None] / obj.radius
+                                )
+                            except Exception:
+                                pass
             elif isinstance(obj, nengo.Connection):
                 conn_params = model.params.get(obj)
                 if conn_params is not None and "weights" in obj_params:
+                    weights = np.asarray(obj_params["weights"])
                     try:
-                        conn_params.weights = obj_params["weights"]
+                        conn_params.weights = weights
+                    except Exception:
+                        pass
+                    try:
+                        solver_uses_weights = (
+                            isinstance(obj.pre_obj, nengo.ensemble.Neurons)
+                            or isinstance(obj.post_obj, nengo.ensemble.Neurons)
+                        )
+                        solver_values = weights if solver_uses_weights else weights.T
+                        obj.solver = nengo.solvers.NoSolver(
+                            solver_values,
+                            weights=solver_uses_weights,
+                        )
                     except Exception:
                         pass
 
@@ -782,6 +986,7 @@ class Simulator:
             File path. If the path does not end in ``.npz``, that extension
             is added automatically (matching ``np.savez`` behaviour).
         """
+        self._ensure_open()
         # Ensure consistent extension so load_params can find the file
         if not path.endswith(".npz"):
             path = path + ".npz"
@@ -797,6 +1002,7 @@ class Simulator:
             Path to the saved parameter file. The ``.npz`` extension may be
             omitted; it is added automatically if the bare path is not found.
         """
+        self._ensure_open()
         import os
         if not os.path.exists(path) and not path.endswith(".npz"):
             path = path + ".npz"
@@ -817,6 +1023,7 @@ class Simulator:
 
         Returns True if gradients are correct.
         """
+        self._ensure_open()
         import torch.autograd
         params = self.trainable_params()
         if not params:

@@ -63,9 +63,7 @@ class SignalDict:
         self._is_param[base_id] = trainable
 
         # Convert initial value to tensor
-        init_val = sig.initial_value
-        if not isinstance(init_val, np.ndarray):
-            init_val = np.array(init_val)
+        init_val = self._normalize_initial_value(sig.initial_value)
 
         # Choose dtype
         if np.issubdtype(init_val.dtype, np.floating):
@@ -199,9 +197,7 @@ class SignalDict:
         """
         for base_id, sig in self._base_signals.items():
             if not self._is_param[base_id]:
-                init_val = sig.initial_value
-                if not isinstance(init_val, np.ndarray):
-                    init_val = np.array(init_val)
+                init_val = self._normalize_initial_value(sig.initial_value)
 
                 if np.issubdtype(init_val.dtype, np.floating):
                     t_dtype = self.dtype
@@ -245,3 +241,19 @@ class SignalDict:
         n_params = sum(1 for v in self._is_param.values() if v)
         n_state = sum(1 for v in self._is_param.values() if not v)
         return f"SignalDict(params={n_params}, state={n_state}, batch={self.minibatch_size})"
+
+    @staticmethod
+    def _normalize_initial_value(init_val):
+        """Convert Nengo signal initial values into tensor-friendly ndarrays."""
+        if hasattr(init_val, "toarray"):
+            init_val = init_val.toarray()
+
+        if not isinstance(init_val, np.ndarray):
+            init_val = np.array(init_val)
+
+        if init_val.dtype == np.object_ and init_val.size == 1:
+            scalar = init_val.item()
+            if hasattr(scalar, "toarray"):
+                init_val = np.array(scalar.toarray())
+
+        return init_val

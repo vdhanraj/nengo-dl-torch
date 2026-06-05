@@ -65,6 +65,16 @@ class TestConverterBasic:
         c = Converter(model)
         assert len(c.outputs) > 0
 
+    def test_outputs_expose_modules_and_final_outputs_only(self):
+        model = _make_mlp()
+        c = Converter(model)
+        assert model[0] in c.outputs
+        assert model[1] in c.outputs
+        assert model[2] in c.outputs
+        assert "output_0" in c.outputs
+        assert "relu" not in c.outputs
+        assert "linear" not in c.outputs
+
     def test_input_is_node(self):
         model = _make_mlp(in_size=4)
         c = Converter(model)
@@ -103,6 +113,43 @@ class TestConverterBasic:
             err_msg="scale_firing_rates must not change rate-mode output"
         )
 
+    def test_multi_input_inputs_are_exposed(self):
+        class TwoInputAdd(nn.Module):
+            def forward(self, x, y):
+                return x + y
+
+        c = Converter(TwoInputAdd(), input_shape=((4,), (4,)))
+        assert list(c.inputs.keys()) == ["x", "y"]
+
+    def test_tuple_outputs_are_exposed(self):
+        class TwoOutput(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(4, 3)
+                self.b = nn.Linear(4, 2)
+
+            def forward(self, x):
+                return self.a(x), self.b(x)
+
+        c = Converter(TwoOutput(), input_shape=(4,))
+        assert "output_0" in c.outputs
+        assert "output_1" in c.outputs
+
+    def test_dict_outputs_are_exposed(self):
+        class DictOutput(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(4, 3)
+                self.b = nn.Linear(4, 2)
+
+            def forward(self, x):
+                return {"logits": self.a(x), "aux": self.b(x)}
+
+        c = Converter(DictOutput(), input_shape=(4,))
+        assert "logits" in c.outputs
+        assert "aux" in c.outputs
+        assert isinstance(c.output_structure, dict)
+
 
 # ---------------------------------------------------------------------------
 # Layer-specific conversion
@@ -129,6 +176,50 @@ class TestConverterLayers:
         c = Converter(model)
         assert isinstance(c.net, nengo.Network)
 
+    def test_converts_permute(self):
+        class PermuteLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 2, bias=False)
+
+            def forward(self, x):
+                x = x.permute(0, 2, 1)
+                return self.fc(torch.flatten(x, start_dim=1))
+
+        model = PermuteLinear().eval()
+        c = Converter(model, input_shape=(2, 2))
+        assert isinstance(c.net, nengo.Network)
+
+    def test_converts_transpose(self):
+        class TransposeLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 2, bias=False)
+
+            def forward(self, x):
+                x = torch.transpose(x, 1, 2)
+                return self.fc(torch.flatten(x, start_dim=1))
+
+        model = TransposeLinear().eval()
+        c = Converter(model, input_shape=(2, 2))
+        assert isinstance(c.net, nengo.Network)
+
+    def test_permute_batch_axis_raises(self):
+        class BadPermute(nn.Module):
+            def forward(self, x):
+                return x.permute(1, 0, 2)
+
+        with pytest.raises(ConversionError, match="batch dimension"):
+            Converter(BadPermute().eval(), input_shape=(2, 2))
+
+    def test_transpose_batch_axis_raises(self):
+        class BadTranspose(nn.Module):
+            def forward(self, x):
+                return x.transpose(0, 1)
+
+        with pytest.raises(ConversionError, match="batch dimension"):
+            Converter(BadTranspose().eval(), input_shape=(2, 2))
+
     def test_converts_identity(self):
         model = nn.Sequential(nn.Identity(), nn.Linear(4, 2))
         c = Converter(model)
@@ -143,12 +234,54 @@ class TestConverterLayers:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             c = Converter(model, allow_fallback=True)
-        assert any("not natively supported" in str(warning.message) for warning in w)
+        assert any("TorchNode fallback" in str(warning.message) for warning in w)
+        assert any("spiking fidelity" in str(warning.message) for warning in w)
+
+    def test_batchnorm_native_in_inference_only(self):
+        model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4)).eval()
+        c = Converter(model, inference_only=True)
+        assert not any(isinstance(node, nengo_dl.TorchNode) for node in c.net.all_nodes)
+
+    def test_maxpool_native_with_max_to_avg_pool(self):
+        model = nn.Sequential(nn.MaxPool2d(2), nn.Flatten()).eval()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            c = Converter(model, input_shape=(1, 4, 4), max_to_avg_pool=True)
+        assert isinstance(c.net, nengo.Network)
+        assert any("converted as average pooling" in str(warning.message) for warning in w)
+
+    def test_maxpool_as_avg_matches_avgpool_conversion(self):
+        max_model = nn.Sequential(nn.MaxPool2d(2), nn.Flatten()).eval()
+        avg_model = nn.Sequential(nn.AvgPool2d(2), nn.Flatten()).eval()
+        x_np = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+
+        c_max = Converter(max_model, input_shape=(1, 4, 4), max_to_avg_pool=True)
+        c_avg = Converter(avg_model, input_shape=(1, 4, 4))
+
+        inp_max = list(c_max.inputs.values())[0]
+        inp_avg = list(c_avg.inputs.values())[0]
+        out_max = c_max.outputs["output_0"]
+        out_avg = c_avg.outputs["output_0"]
+
+        with c_max.net:
+            p_max = nengo.Probe(out_max, synapse=None)
+        with c_avg.net:
+            p_avg = nengo.Probe(out_avg, synapse=None)
+
+        with nengo_dl.Simulator(c_max.net, seed=0) as sim_max:
+            sim_max.run_steps(1, data={inp_max: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            max_out = sim_max.data[p_max][0]
+
+        with nengo_dl.Simulator(c_avg.net, seed=0) as sim_avg:
+            sim_avg.run_steps(1, data={inp_avg: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            avg_out = sim_avg.data[p_avg][0]
+
+        np.testing.assert_allclose(max_out, avg_out, rtol=1e-5, atol=1e-5)
 
     def test_allow_fallback_false_raises(self):
         class UnsupportedLayer(nn.Module):
             def forward(self, x):
-                return x
+                return x[:, :2]
 
         model = nn.Sequential(nn.Linear(4, 4), UnsupportedLayer())
         with pytest.raises(ConversionError):
@@ -208,6 +341,280 @@ class TestConverterLayers:
             nengo_out = sim.data[p][0:1]
 
         np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
+
+    def test_branch_add_rate_matches_pytorch(self):
+        class ResidualAdd(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(4, 4, bias=True)
+                self.b = nn.Linear(4, 4, bias=True)
+
+            def forward(self, x):
+                return self.a(x) + self.b(x)
+
+        torch.manual_seed(9)
+        model = ResidualAdd().eval()
+        x_np = np.random.RandomState(10).randn(4).astype(np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model)
+        inp = list(c.inputs.values())[0]
+        out = list(c.outputs.values())[-1]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
+
+    def test_branch_sub_rate_matches_pytorch(self):
+        class ResidualSub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(4, 4, bias=True)
+                self.b = nn.Linear(4, 4, bias=True)
+
+            def forward(self, x):
+                return self.a(x) - self.b(x)
+
+        torch.manual_seed(19)
+        model = ResidualSub().eval()
+        x_np = np.random.RandomState(20).randn(4).astype(np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model)
+        inp = list(c.inputs.values())[0]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
+
+    def test_two_input_add_rate_matches_pytorch(self):
+        class TwoInputAdd(nn.Module):
+            def forward(self, x, y):
+                return x + y
+
+        model = TwoInputAdd().eval()
+        x_np = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        y_np = np.array([0.5, -1.0, 2.0, 1.5], dtype=np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0), torch.tensor(y_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=((4,), (4,)))
+        x_inp = c.inputs["x"]
+        y_inp = c.inputs["y"]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(
+                1,
+                data={
+                    x_inp: x_np.reshape(1, 1, -1),
+                    y_inp: y_np.reshape(1, 1, -1),
+                },
+                inference_mode="rate",
+            )
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
+
+    def test_scalar_mul_rate_matches_pytorch(self):
+        class ScalarMul(nn.Module):
+            def forward(self, x):
+                return x * 0.5
+
+        model = ScalarMul().eval()
+        x_np = np.array([1.0, -2.0, 3.0, -4.0], dtype=np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(4,))
+        inp = c.inputs["x"]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-6, atol=1e-6)
+
+    def test_scalar_sub_rate_matches_pytorch(self):
+        class ScalarSub(nn.Module):
+            def forward(self, x):
+                return x - 1.5
+
+        model = ScalarSub().eval()
+        x_np = np.array([1.0, -2.0, 3.0, -4.0], dtype=np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(4,))
+        inp = c.inputs["x"]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-6, atol=1e-6)
+
+    def test_reverse_scalar_sub_rate_matches_pytorch(self):
+        class ReverseScalarSub(nn.Module):
+            def forward(self, x):
+                return 1.5 - x
+
+        model = ReverseScalarSub().eval()
+        x_np = np.array([1.0, -2.0, 3.0, -4.0], dtype=np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(4,))
+        inp = c.inputs["x"]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-6, atol=1e-6)
+
+    def test_tensor_tensor_mul_uses_fallback_and_warns(self):
+        class TensorMul(nn.Module):
+            def forward(self, x, y):
+                return x * y
+
+        model = TensorMul().eval()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            c = Converter(model, input_shape=((4,), (4,)))
+
+        assert isinstance(c.net, nengo.Network)
+        assert any("TorchNode fallback" in str(warning.message) for warning in w)
+
+    def test_tuple_outputs_run_in_simulator(self):
+        class TwoOutput(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(4, 3)
+                self.b = nn.Linear(4, 2)
+
+            def forward(self, x):
+                return self.a(x), self.b(x)
+
+        model = TwoOutput().eval()
+        x_np = np.random.RandomState(1).randn(4).astype(np.float32)
+        c = Converter(model, input_shape=(4,))
+        inp = c.inputs["x"]
+        out0 = c.outputs["output_0"]
+        out1 = c.outputs["output_1"]
+        with c.net:
+            p0 = nengo.Probe(out0, synapse=None)
+            p1 = nengo.Probe(out1, synapse=None)
+
+        with torch.no_grad():
+            pt0, pt1 = model(torch.tensor(x_np).unsqueeze(0))
+            pt0 = pt0.numpy()[0]
+            pt1 = pt1.numpy()[0]
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo0 = sim.data[p0][0]
+            nengo1 = sim.data[p1][0]
+
+        np.testing.assert_allclose(nengo0, pt0, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(nengo1, pt1, rtol=1e-5, atol=1e-5)
+
+    def test_reused_module_matches_pytorch_and_uses_shared_weights(self):
+        class SharedLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared = nn.Linear(4, 4, bias=False)
+
+            def forward(self, x):
+                a = self.shared(x)
+                b = self.shared(x + 1.0)
+                return a + b
+
+        torch.manual_seed(2)
+        model = SharedLinear().eval()
+        x_np = np.random.RandomState(2).randn(4).astype(np.float32)
+
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(4,))
+        inp = c.inputs["x"]
+        out = c.outputs["output_0"]
+        assert "shared" in c.outputs
+        assert "shared_1" in c.outputs
+
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+            weights = sim.get_weights()
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
+
+        shared_weight_keys = [k for k in weights if k.endswith(".weight")]
+        assert len(shared_weight_keys) == 1, (
+            f"Expected one shared module weight set, got {shared_weight_keys}"
+        )
+
+    def test_fallback_uses_torchnode(self):
+        class UnsupportedLayer(nn.Module):
+            def forward(self, x):
+                return x[:, :2]
+
+        model = nn.Sequential(nn.Linear(4, 4), UnsupportedLayer())
+        c = Converter(model, allow_fallback=True)
+        assert any(isinstance(node, nengo_dl.TorchNode) for node in c.net.all_nodes)
+
+    def test_reused_module_exposes_callsite_aliases_only_for_reuse(self):
+        class SharedLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared = nn.Linear(4, 4, bias=False)
+
+            def forward(self, x):
+                a = self.shared(x)
+                b = self.shared(x + 1.0)
+                return a + b
+
+        c = Converter(SharedLinear(), input_shape=(4,))
+        assert "shared" in c.outputs
+        assert "shared_1" in c.outputs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_converter_shapeprop_uses_model_device(self):
+        model = nn.Sequential(nn.Conv2d(1, 2, 3), nn.ReLU()).cuda().eval()
+        c = Converter(model, input_shape=(1, 8, 8))
+        assert isinstance(c.net, nengo.Network)
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +1116,71 @@ class TestConverterLayerCoverage:
         np.testing.assert_allclose(nengo_out, pt_out, atol=1e-4,
                                    err_msg="Flatten+Linear output must match PyTorch")
 
+    def test_permute_flatten_linear_exact_output(self):
+        class PermuteFlattenLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 2, bias=False)
+
+            def forward(self, x):
+                return self.fc(torch.flatten(x.permute(0, 2, 1), start_dim=1))
+
+        model = PermuteFlattenLinear()
+        with torch.no_grad():
+            model.fc.weight.data = torch.tensor(
+                [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 1.5, 2.0]]
+            )
+        model.eval()
+
+        x_np = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(2, 2))
+        inp = list(c.inputs.values())[0]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, atol=1e-5, rtol=1e-5)
+
+    def test_transpose_view_linear_exact_output(self):
+        class TransposeViewLinear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 2, bias=False)
+
+            def forward(self, x):
+                x = x.transpose(1, 2)
+                return self.fc(torch.flatten(x, start_dim=1))
+
+        model = TransposeViewLinear()
+        with torch.no_grad():
+            model.fc.weight.data = torch.tensor(
+                [[2.0, 0.0, -1.0, 1.0], [1.0, 3.0, 0.0, -2.0]]
+            )
+        model.eval()
+
+        x_np = np.array([[2.0, 1.0], [0.0, -1.0]], dtype=np.float32)
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(2, 2))
+        inp = list(c.inputs.values())[0]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, atol=1e-5, rtol=1e-5)
+
     def test_linear_bias_false_exact_output(self):
         """nn.Linear with bias=False converts correctly; output = W@x."""
         W = np.array([[2.0, 0.0], [0.0, 3.0]], dtype=np.float32)
@@ -733,7 +1205,7 @@ class TestConverterLayerCoverage:
                                    err_msg=f"bias=False output must equal relu(W@x)={expected}")
 
     def test_batchnorm_uses_fallback_and_warns(self):
-        """BatchNorm1d is not natively converted; it uses the fallback and warns."""
+        """BatchNorm1d falls back unless inference_only=True."""
         model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4))
         model.eval()
 
@@ -742,21 +1214,57 @@ class TestConverterLayerCoverage:
             c = Converter(model)
 
         assert isinstance(c.net, nengo.Network), "BatchNorm fallback must produce a valid Network"
-        assert any("not natively supported" in str(warning.message) for warning in w), (
+        assert any("TorchNode fallback" in str(warning.message) for warning in w), (
             "BatchNorm must warn about fallback conversion"
         )
 
     def test_maxpool_uses_fallback_and_warns(self):
-        """MaxPool1d is not natively converted; it uses the fallback and warns."""
-        model = nn.Sequential(nn.Linear(4, 4), nn.MaxPool1d(2))
+        """MaxPool2d falls back unless max_to_avg_pool=True."""
+        model = nn.Sequential(nn.MaxPool2d(2), nn.Flatten())
         model.eval()
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            c = Converter(model)
+            c = Converter(model, input_shape=(1, 4, 4))
 
         assert isinstance(c.net, nengo.Network), "MaxPool fallback must produce a valid Network"
-        assert any("not natively supported" in str(warning.message) for warning in w)
+        assert any("TorchNode fallback" in str(warning.message) for warning in w)
+
+    def test_avgpool2d_native_matches_pytorch(self):
+        model = nn.Sequential(nn.AvgPool2d(2), nn.Flatten()).eval()
+        x_np = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, input_shape=(1, 4, 4))
+        inp = list(c.inputs.values())[0]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
+
+    def test_batchnorm1d_native_matches_pytorch_inference(self):
+        model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4)).eval()
+        x_np = np.random.RandomState(0).randn(4).astype(np.float32)
+        with torch.no_grad():
+            pt_out = model(torch.tensor(x_np).unsqueeze(0)).numpy()[0]
+
+        c = Converter(model, inference_only=True)
+        inp = list(c.inputs.values())[0]
+        out = c.outputs["output_0"]
+        with c.net:
+            p = nengo.Probe(out, synapse=None)
+
+        with nengo_dl.Simulator(c.net, seed=0) as sim:
+            sim.run_steps(1, data={inp: x_np.reshape(1, 1, -1)}, inference_mode="rate")
+            nengo_out = sim.data[p][0]
+
+        np.testing.assert_allclose(nengo_out, pt_out, rtol=1e-5, atol=1e-5)
 
     def test_three_layer_chain_argmax_matches_pytorch(self):
         """3-layer Linear→ReLU→Linear→ReLU→Linear: rate-mode argmax matches PyTorch."""

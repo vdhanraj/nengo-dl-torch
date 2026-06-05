@@ -54,6 +54,20 @@ class TestLifecycle:
         sim.close()
         sim.close()  # second close should not raise
 
+    def test_close_prevents_further_use(self):
+        net, inp, out, p = _make_simple_net()
+        sim = nengo_dl.Simulator(net, seed=0)
+        sim.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            sim.run_steps(1)
+
+    def test_close_blocks_parameter_access(self):
+        net, inp, out, p = _make_simple_net()
+        sim = nengo_dl.Simulator(net, seed=0)
+        sim.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            sim.get_weights()
+
     def test_dt_stored(self):
         net, _, _, _ = _make_simple_net()
         with nengo_dl.Simulator(net, dt=0.005) as sim:
@@ -100,6 +114,37 @@ class TestRunSteps:
             sim.run_steps(3, data={inp: x})
             data = sim.data[p]
         assert data.shape == (bs, 3, 1)
+
+    def test_predict_respects_batch_size(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.ones((8, 2, 1), dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            data = sim.predict(x={inp: x}, n_steps=2, batch_size=4)
+        assert data[p].shape == (8, 2, 1)
+
+    def test_predict_matches_run_steps_for_same_input(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.linspace(-1.0, 1.0, 8, dtype=np.float32).reshape(8, 1, 1)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            pred = sim.predict(x={inp: x}, n_steps=1, batch_size=4)[p].copy()
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            sim.run_steps(1, data={inp: x})
+            run = sim.data[p].copy()
+        np.testing.assert_allclose(pred, run, rtol=1e-5)
+
+    def test_predict_batch_size_smaller_than_minibatch_raises(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.ones((4, 1, 1), dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            with pytest.raises(ValueError, match=">= minibatch_size"):
+                sim.predict(x={inp: x}, n_steps=1, batch_size=1)
+
+    def test_predict_batch_size_not_divisible_by_minibatch_raises(self):
+        net, inp, out, p = _make_simple_net()
+        x = np.ones((4, 1, 1), dtype=np.float32)
+        with nengo_dl.Simulator(net, minibatch_size=2, seed=0) as sim:
+            with pytest.raises(ValueError, match="divisible by minibatch_size"):
+                sim.predict(x={inp: x}, n_steps=1, batch_size=3)
 
     def test_run_time(self):
         net, inp, out, p = _make_simple_net()
@@ -491,6 +536,17 @@ class TestSimulationData:
             r = repr(sim.data)
         assert "SimulationData" in r
 
+    def test_contains_supported_and_unsupported_keys(self):
+        net, inp, out, p = _make_simple_net()
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            assert p not in sim.data
+            sim.run_steps(1)
+            ens = net.ensembles[0]
+            assert p in sim.data
+            assert ens in sim.data
+            assert inp not in sim.data
+            assert object() not in sim.data
+
 
 # ---------------------------------------------------------------------------
 # Determinism
@@ -760,6 +816,109 @@ class TestFreezeParams:
 
         with nengo_dl.Simulator(net, seed=0) as sim:
             sim.freeze_params([ens, conn])  # should not raise
+
+    def test_freeze_params_updates_ensemble_object(self):
+        with nengo.Network(seed=0) as net:
+            ens = nengo.Ensemble(5, 1, seed=0)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            model = sim._model
+            ens_sig = model.sig[ens]["encoders"]
+            bias_sig = model.sig[ens.neurons]["bias"]
+
+            new_scaled = np.full(ens_sig.shape, 0.5, dtype=np.float32)
+            new_bias = np.linspace(-0.2, 0.2, ens.n_neurons, dtype=np.float32)
+
+            sim.tensor_graph.signals.scatter(
+                ens_sig,
+                torch.tensor(new_scaled, dtype=sim.tensor_graph.dtype, device=sim.tensor_graph.device),
+            )
+            sim.tensor_graph.signals.scatter(
+                bias_sig,
+                torch.tensor(new_bias, dtype=sim.tensor_graph.dtype, device=sim.tensor_graph.device),
+            )
+
+            sim.freeze_params([ens])
+
+        np.testing.assert_allclose(np.asarray(ens.bias), new_bias, rtol=1e-5)
+        expected_gain = np.linalg.norm(new_scaled, axis=1) * ens.radius
+        expected_enc = new_scaled / np.where(np.abs(new_scaled) > 1e-12, np.abs(new_scaled), 1.0)
+        np.testing.assert_allclose(np.asarray(ens.gain), expected_gain, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(ens.encoders), expected_enc, rtol=1e-5)
+
+    def test_freeze_params_updates_connection_solver_weights(self):
+        with nengo.Network(seed=0) as net:
+            pre = nengo.Ensemble(6, 1, seed=0)
+            out = nengo.Node(size_in=1)
+            conn = nengo.Connection(pre, out, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            model = sim._model
+            weight_sig = model.sig[conn]["weights"]
+            new_weights = np.full(weight_sig.shape, 0.25, dtype=np.float32)
+            sim.tensor_graph.signals.scatter(
+                weight_sig,
+                torch.tensor(new_weights, dtype=sim.tensor_graph.dtype, device=sim.tensor_graph.device),
+            )
+            sim.freeze_params([conn])
+
+        assert isinstance(conn.solver, nengo.solvers.NoSolver)
+        assert conn.solver.weights is False
+        np.testing.assert_allclose(np.asarray(conn.solver.values), new_weights.T, rtol=1e-5)
+
+    def test_freeze_params_rebuilds_ensemble_params_in_new_model(self):
+        with nengo.Network(seed=0) as net:
+            ens = nengo.Ensemble(5, 1, seed=0)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            model = sim._model
+            enc_sig = model.sig[ens]["encoders"]
+            bias_sig = model.sig[ens.neurons]["bias"]
+            gain = np.asarray(model.params[ens].gain).copy()
+            new_scaled = np.full(enc_sig.shape, 0.75, dtype=np.float32)
+            new_bias = np.linspace(-0.1, 0.1, ens.n_neurons, dtype=np.float32)
+            sim.tensor_graph.signals.scatter(
+                enc_sig,
+                torch.tensor(new_scaled, dtype=sim.tensor_graph.dtype, device=sim.tensor_graph.device),
+            )
+            sim.tensor_graph.signals.scatter(
+                bias_sig,
+                torch.tensor(new_bias, dtype=sim.tensor_graph.dtype, device=sim.tensor_graph.device),
+            )
+            sim.freeze_params([ens])
+
+        rebuilt = nengo.builder.Model(dt=0.001)
+        nengo.builder.Builder.build(rebuilt, net)
+        rebuilt_params = rebuilt.params[ens]
+        expected_gain = np.linalg.norm(new_scaled, axis=1) * ens.radius
+        expected_enc = new_scaled / np.where(np.abs(new_scaled) > 1e-12, np.abs(new_scaled), 1.0)
+        np.testing.assert_allclose(np.asarray(rebuilt_params.gain), expected_gain, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(rebuilt_params.encoders), expected_enc, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(rebuilt_params.scaled_encoders), new_scaled, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(rebuilt_params.bias), new_bias, rtol=1e-5)
+
+    def test_freeze_params_rebuilds_connection_weights_in_new_model(self):
+        with nengo.Network(seed=0) as net:
+            pre = nengo.Ensemble(6, 1, seed=0)
+            post = nengo.Ensemble(4, 1, seed=1)
+            conn = nengo.Connection(pre, post, synapse=None)
+
+        with nengo_dl.Simulator(net, seed=0) as sim:
+            weight_sig = sim._model.sig[conn]["weights"]
+            new_weights = np.full(weight_sig.shape, 0.125, dtype=np.float32)
+            sim.tensor_graph.signals.scatter(
+                weight_sig,
+                torch.tensor(new_weights, dtype=sim.tensor_graph.dtype, device=sim.tensor_graph.device),
+            )
+            sim.freeze_params([conn])
+
+        rebuilt = nengo.builder.Model(dt=0.001)
+        nengo.builder.Builder.build(rebuilt, net)
+        np.testing.assert_allclose(
+            np.asarray(rebuilt.params[conn].weights),
+            new_weights,
+            rtol=1e-5,
+        )
 
 
 # ---------------------------------------------------------------------------

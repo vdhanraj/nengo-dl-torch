@@ -786,12 +786,13 @@ class TestSimNeuronsReference:
             p = nengo.Probe(inp, synapse=tau)
 
         with nengo_dl.Simulator(net, dt=dt, seed=0) as sim:
-            sim.run_steps(n)
+            sim.run_steps(n + 1)
             out = sim.data[p].flatten()
 
-        # Analytical: y[k] = 1 - exp(-k*dt/tau) for step k=1..n
+        # Probe records filter state before each step's update; skip out[0]
+        # (initial state = 0) and compare steps 1..n against analytical formula.
         expected = np.array([1.0 - np.exp(-k * dt / tau) for k in range(1, n + 1)])
         np.testing.assert_allclose(
-            out, expected, atol=1e-4,
+            out[1:], expected, atol=1e-4,
             err_msg="Synapse step response must match analytical formula"
         )

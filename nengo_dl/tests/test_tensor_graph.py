@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 import nengo
 import nengo_dl
-from nengo_dl.tensor_graph import TensorGraph, _is_trainable_signal, topo_sort
+from nengo_dl.tensor_graph import (
+    TensorGraph,
+    _is_trainable_signal,
+    _is_trainable_param_role,
+    topo_sort,
+)
 from nengo.builder import Builder as NengoBuilder, Model as NengoModel
 from nengo.builder.signal import Signal
 
@@ -233,13 +238,13 @@ class TestSignalOrdering:
 # ---------------------------------------------------------------------------
 
 class TestTrainableDetection:
-    def test_readonly_signal_is_trainable(self):
-        """A readonly signal that is not a scalar constant is trainable."""
+    def test_readonly_signal_without_owner_is_not_trainable(self):
+        """Trainable detection requires an explicit supported owner/role pair."""
         sig = Signal(np.ones(5), name="w")
         sig._readonly = True
 
         model = NengoModel()
-        assert _is_trainable_signal(sig, model) is True
+        assert _is_trainable_signal(sig, model) is False
 
     def test_non_readonly_signal_is_not_trainable(self):
         """A signal that is not readonly is not trainable."""
@@ -248,6 +253,89 @@ class TestTrainableDetection:
 
         model = NengoModel()
         assert _is_trainable_signal(sig, model) is False
+
+    def test_connection_weights_role_is_trainable(self):
+        with nengo.Network(seed=0) as net:
+            pre = nengo.Ensemble(10, 1, seed=0)
+            post = nengo.Ensemble(10, 1, seed=1)
+            conn = nengo.Connection(pre, post, synapse=None)
+
+        model = NengoModel()
+        NengoBuilder.build(model, net)
+        sig = model.sig[conn]["weights"]
+        sig_owner = {sig.base: (conn, "weights"), sig: (conn, "weights")}
+        assert _is_trainable_signal(sig, model, sig_owner=sig_owner) is True
+
+    def test_ensemble_encoders_role_is_trainable(self):
+        with nengo.Network(seed=0) as net:
+            ens = nengo.Ensemble(10, 1, seed=0)
+
+        model = NengoModel()
+        NengoBuilder.build(model, net)
+        sig = model.sig[ens]["encoders"]
+        sig_owner = {sig.base: (ens, "encoders"), sig: (ens, "encoders")}
+        assert _is_trainable_signal(sig, model, sig_owner=sig_owner) is True
+
+    def test_neuron_bias_role_is_trainable(self):
+        with nengo.Network(seed=0) as net:
+            ens = nengo.Ensemble(10, 1, seed=0)
+
+        model = NengoModel()
+        NengoBuilder.build(model, net)
+        neurons = ens.neurons
+        sig = model.sig[neurons]["bias"]
+        sig_owner = {sig.base: (neurons, "bias"), sig: (neurons, "bias")}
+        assert _is_trainable_signal(sig, model, sig_owner=sig_owner) is True
+
+    def test_non_parameter_role_is_not_trainable(self):
+        with nengo.Network(seed=0) as net:
+            ens = nengo.Ensemble(10, 1, seed=0)
+
+        model = NengoModel()
+        NengoBuilder.build(model, net)
+        sig = model.sig[ens.neurons]["voltage"]
+        sig_owner = {
+            sig.base: (ens.neurons, "voltage"),
+            sig: (ens.neurons, "voltage"),
+        }
+        assert _is_trainable_signal(sig, model, sig_owner=sig_owner) is False
+
+    def test_synapse_state_signal_is_not_trainable(self):
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            nengo.Connection(inp, ens, synapse=0.1)
+
+        tg = _build(net)
+        lowpass_states = [
+            sig
+            for obj, roles in tg.model.sig.items()
+            if type(obj).__name__ == "Lowpass"
+            for role, sig in roles.items()
+            if role == "_state_X"
+        ]
+        assert lowpass_states, "Expected a Lowpass state signal in the built model"
+        for sig in lowpass_states:
+            assert tg.signals.get_parameter(sig) is None
+
+    def test_voltage_signal_is_not_registered_as_parameter(self):
+        with nengo.Network(seed=0) as net:
+            ens = nengo.Ensemble(10, 1, neuron_type=nengo.LIF(), seed=0)
+
+        tg = _build(net)
+        voltage_sig = tg.model.sig[ens.neurons]["voltage"]
+        assert tg.signals.get_parameter(voltage_sig) is None
+
+    def test_trainable_role_helper(self):
+        with nengo.Network(seed=0) as net:
+            inp = nengo.Node(np.zeros(1))
+            ens = nengo.Ensemble(10, 1, seed=0)
+            conn = nengo.Connection(inp, ens, synapse=None)
+
+        assert _is_trainable_param_role(conn, "weights") is True
+        assert _is_trainable_param_role(ens, "encoders") is True
+        assert _is_trainable_param_role(ens.neurons, "bias") is True
+        assert _is_trainable_param_role(ens.neurons, "voltage") is False
 
     def test_scalar_zero_signal_not_trainable(self):
         """A signal named ZERO with size=1 is never trainable."""

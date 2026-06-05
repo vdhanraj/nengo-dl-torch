@@ -34,6 +34,10 @@ def _run_filtered(process, n_steps=50, dt=0.001, seed=0, bs=1):
 # ---------------------------------------------------------------------------
 
 class TestLowpassSynapse:
+    def test_zero_tau_is_one_step_delay(self):
+        out = _run_filtered(nengo.synapses.Lowpass(tau=0), n_steps=5)
+        np.testing.assert_allclose(out[:, 0], [0.0, 1.0, 1.0, 1.0, 1.0], atol=1e-6)
+
     def test_output_shape(self):
         out = _run_filtered(nengo.synapses.Lowpass(tau=0.01))
         assert out.shape == (50, 1)
@@ -151,9 +155,10 @@ class TestLowpassMatchesNengo:
             dl_sim.run_steps(n_steps)
             dl_out = dl_sim.data[p]
 
-        # Analytical: y[k] = input_val * (1 - alpha^k), alpha = exp(-dt/tau)
+        # Probe records state before each step's update; step 0 = initial state (0),
+        # step k = input_val * (1 - alpha^k).
         alpha = np.exp(-dt / tau)
-        ks = np.arange(1, n_steps + 1)
+        ks = np.arange(0, n_steps)
         expected = input_val * (1.0 - alpha ** ks)
 
         np.testing.assert_allclose(dl_out[:, 0], expected, rtol=1e-3, atol=1e-4)
@@ -193,10 +198,9 @@ class TestMatchesReferenceNengo:
             dl.run_steps(n_steps)
             dl_out = dl.data[p]
 
-        # dl_out is one step ahead of ref_out; compare the shared region
         np.testing.assert_allclose(
-            dl_out[:-1], ref_out[1:], rtol=1e-4, atol=1e-5,
-            err_msg="nengo-dl Lowpass does not match reference Nengo (shifted comparison)"
+            dl_out, ref_out, rtol=1e-4, atol=1e-5,
+            err_msg="nengo-dl Lowpass does not match reference Nengo"
         )
 
     def test_alpha_synapse_analytical(self):
@@ -221,10 +225,11 @@ class TestMatchesReferenceNengo:
             dl.run_steps(n_steps)
             dl_out = dl.data[p]
 
-        # Compute analytical Euler cascaded Lowpass
+        # Probe records state before each step's update; include initial state (0)
+        # and compute n_steps-1 subsequent updates.
         y1, y2 = 0.0, 0.0
-        expected = []
-        for _ in range(n_steps):
+        expected = [0.0]
+        for _ in range(n_steps - 1):
             y1 = alpha * y1 + (1 - alpha) * 1.0
             y2 = alpha * y2 + (1 - alpha) * y1
             expected.append(y2)
@@ -281,9 +286,9 @@ class TestMatchesReferenceNengo:
 
         assert out_batch.shape == (mini_size, n_steps, 1)
 
-        # Verify that each batch item matches the analytical step response
+        # Probe records state before each step's update; step 0 = 0.
         alpha = np.exp(-dt / tau)
-        ks = np.arange(1, n_steps + 1)
+        ks = np.arange(0, n_steps)
         for i, scale in enumerate(range(1, mini_size + 1)):
             expected = scale * (1.0 - alpha ** ks)
             np.testing.assert_allclose(

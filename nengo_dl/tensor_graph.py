@@ -59,14 +59,19 @@ def _check_object_trainable(obj, model: NengoModel, default: bool) -> bool:
     try:
         network = model.toplevel
         if network is not None:
+            # Check instance-level config from the most specific enclosing
+            # network first, since nested subnetworks can override trainability
+            # for objects they contain.
+            for subnetwork in reversed(list(network.all_networks)):
+                cfg = subnetwork.config
+                try:
+                    inst_val = getattr(cfg[obj], 'trainable', None)
+                    if inst_val is not None:
+                        return bool(inst_val)
+                except Exception:
+                    pass
+
             cfg = network.config
-            # Check instance-level config first
-            try:
-                inst_val = getattr(cfg[obj], 'trainable', None)
-                if inst_val is not None:
-                    return bool(inst_val)
-            except Exception:
-                pass
             # Check class-level config (e.g. net.config[nengo.Ensemble].trainable = True)
             try:
                 cls_val = getattr(cfg[type(obj)], 'trainable', None)
@@ -88,6 +93,20 @@ def _check_object_trainable(obj, model: NengoModel, default: bool) -> bool:
     return bool(_global_settings.get('trainable', default))
 
 
+def _is_trainable_param_role(obj, role: str) -> bool:
+    """Return whether an object/role pair corresponds to a learnable parameter."""
+    if hasattr(obj, 'ensemble') and isinstance(getattr(obj, 'ensemble', None), nengo.Ensemble):
+        return role == "bias"
+
+    if isinstance(obj, nengo.Connection):
+        return role == "weights"
+
+    if isinstance(obj, nengo.Ensemble):
+        return role in {"encoders", "scaled_encoders", "gain", "bias"}
+
+    return False
+
+
 def _is_trainable_signal(sig: Signal, model: NengoModel,
                           sig_owner: dict = None, global_trainable: bool = True) -> bool:
     """Return True if *sig* is a trainable parameter, respecting network config.
@@ -95,7 +114,8 @@ def _is_trainable_signal(sig: Signal, model: NengoModel,
     A signal is trainable if:
     1. It is readonly (set by builder, not changed during simulation)
     2. It is not a scalar constant (ZERO, ONE, step, time)
-    3. Its owning Nengo object is marked trainable in the network config
+    3. It corresponds to an explicitly supported learnable parameter role
+    4. Its owning Nengo object is marked trainable in the network config
     """
     if not sig.readonly:
         return False
@@ -106,17 +126,19 @@ def _is_trainable_signal(sig: Signal, model: NengoModel,
     init = sig.initial_value
     if not isinstance(init, np.ndarray):
         init = np.array(init)
-    if init.size <= 1:
+
+    if sig_owner is None:
         return False
 
-    # Check trainable config for the owning object
-    if sig_owner is not None:
-        entry = sig_owner.get(sig)
-        if entry is not None:
-            obj, role = entry
-            return _check_object_trainable(obj, model, default=global_trainable)
+    entry = sig_owner.get(sig)
+    if entry is None:
+        return False
 
-    return global_trainable
+    obj, role = entry
+    if not _is_trainable_param_role(obj, role):
+        return False
+
+    return _check_object_trainable(obj, model, default=global_trainable)
 
 
 class TensorGraph(nn.Module):
@@ -347,6 +369,7 @@ class TensorGraph(nn.Module):
     def reset_state(self):
         """Reset all time-varying state to initial values."""
         self.signals.reset()
+        self._builder.reset_state()
 
     def get_weights(self) -> Dict[str, np.ndarray]:
         """Return all trainable parameters as a dict of numpy arrays."""
@@ -365,6 +388,10 @@ class TensorGraph(nn.Module):
 
     def set_weights(self, weights: Dict[str, np.ndarray], strict: bool = True):
         """Set trainable parameters from a dict of numpy arrays."""
+        if weights and all(name.startswith("arr_") for name in weights):
+            self._set_legacy_weights(weights)
+            return
+
         if strict:
             # Collect all known keys
             known_keys = set(self._param_dict.keys())
@@ -399,6 +426,45 @@ class TensorGraph(nn.Module):
                     changed = True
 
             if changed:
+                module.load_state_dict(state, strict=False)
+
+    def _set_legacy_weights(self, weights: Dict[str, np.ndarray]):
+        """Load original NengoDL ``save_params`` arrays by shape/order."""
+        candidates = []
+        for name, param in self._param_dict.items():
+            candidates.append((name, tuple(param.shape), "param", param))
+
+        for idx, module in enumerate(self._torch_modules):
+            for name, tensor in module.state_dict().items():
+                if torch.is_tensor(tensor):
+                    candidates.append(
+                        (f"torch_module_{idx:04d}.{name}", tuple(tensor.shape), "module", (module, name))
+                    )
+
+        used = set()
+        for arr_name in sorted(weights, key=lambda x: int(x.split("_")[1])):
+            arr = np.asarray(weights[arr_name])
+            shape = tuple(arr.shape)
+            match_idx = next(
+                (i for i, (_, cand_shape, _, _) in enumerate(candidates)
+                 if i not in used and cand_shape == shape),
+                None,
+            )
+            if match_idx is None:
+                continue
+
+            used.add(match_idx)
+            _, _, kind, target = candidates[match_idx]
+            if kind == "param":
+                with torch.no_grad():
+                    target.copy_(torch.tensor(arr, dtype=self.dtype, device=self.device))
+            else:
+                module, state_name = target
+                state = module.state_dict()
+                current = state[state_name]
+                state[state_name] = torch.as_tensor(
+                    arr, dtype=current.dtype, device=current.device
+                )
                 module.load_state_dict(state, strict=False)
 
     def extra_repr(self) -> str:

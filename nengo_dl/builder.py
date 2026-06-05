@@ -75,6 +75,9 @@ class OpBuilder:
     def build_post(self, ops, signals, config: BuildConfig):
         """Post-build: any cleanup after simulation."""
 
+    def reset_state(self, signals, config: BuildConfig):
+        """Reset any internal state kept outside SignalDict."""
+
     @staticmethod
     def mergeable(x, y) -> bool:
         """Return True if operators *x* and *y* can be merged.
@@ -172,3 +175,8 @@ class Builder:
         """Call build_post on all builders."""
         for (op_type, ops), builder in zip(self._groups, self._builders):
             builder.build_post(ops, self.signals, self.config)
+
+    def reset_state(self):
+        """Reset any builder-local runtime state."""
+        for builder in self._builders:
+            builder.reset_state(self.signals, self.config)
