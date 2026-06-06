@@ -100,6 +100,9 @@ class SimProcessBuilder(OpBuilder):
     def build_step(self, ops, signals, config):
         for step_info in self._process_steps:
             op = step_info["op"]
+            # Skip if this output is being injected externally this step
+            if config.override_sigs and op.output in config.override_sigs:
+                continue
             ptype = step_info["type"]
 
             if ptype == "lowpass":

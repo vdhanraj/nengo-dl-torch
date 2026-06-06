@@ -274,6 +274,10 @@ class SimTorchNodeBuilder(OpBuilder):
             x_sig = op_info["input_sig"]
             out_sig = op_info["output_sig"]
 
+            # Skip nodes whose output is being injected externally this step
+            if config.override_sigs and out_sig in config.override_sigs:
+                continue
+
             # Use smooth LIF module during training or rate-mode inference if
             # lif_smoothing is set.
             smooth = op_info["smooth_module"]

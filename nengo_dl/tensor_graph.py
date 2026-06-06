@@ -72,6 +72,14 @@ def _check_object_trainable(obj, model: NengoModel, default: bool) -> bool:
                     pass
 
             cfg = network.config
+            # Check instance-level config on the toplevel network
+            # (e.g. net.config[specific_connection].trainable = True)
+            try:
+                inst_val = getattr(cfg[obj], 'trainable', None)
+                if inst_val is not None:
+                    return bool(inst_val)
+            except Exception:
+                pass
             # Check class-level config (e.g. net.config[nengo.Ensemble].trainable = True)
             try:
                 cls_val = getattr(cfg[type(obj)], 'trainable', None)
@@ -339,9 +347,14 @@ class TensorGraph(nn.Module):
                 # data_t: (batch, n_steps, size)
                 processed_inputs[sig] = data_t
 
+        # Tell builders which signals are externally injected this run
+        self._config.override_sigs = set(processed_inputs.keys())
+
         # Simulation loop
         for t in range(n_steps):
-            # Inject input for this timestep
+            # Inject input for this timestep (before run_step so downstream
+            # operators see the correct value; SimPyFunc/SimTorchNode skip
+            # their own output if it is in override_sigs)
             for sig, data_t in processed_inputs.items():
                 step_idx = min(t, data_t.shape[1] - 1)
                 val = data_t[:, step_idx, :]  # (batch, size)
@@ -349,6 +362,8 @@ class TensorGraph(nn.Module):
 
             # Run one step of all operators
             self._builder.run_step()
+
+        self._config.override_sigs = None
 
         # Collect probe outputs
         results = {}

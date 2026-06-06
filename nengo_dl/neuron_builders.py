@@ -151,6 +151,7 @@ def _lif_step(op, state_sigs, signals, config):
     tau_rc = neurons.tau_rc
     tau_ref = neurons.tau_ref
     amplitude = neurons.amplitude
+    min_voltage = neurons.min_voltage
 
     J = signals.gather(op.J)  # (batch, n)
     V = signals.gather(state_sigs["voltage"])   # (batch, n)
@@ -171,31 +172,41 @@ def _lif_step(op, state_sigs, signals, config):
         signals.scatter(op.output, output, mode="set")
         return
 
-    # ------ Exact LIF spiking (with surrogate gradient) ------
-    # Decay constant
-    decay = float(np.exp(-dt / tau_rc))
+    # ------ Exact LIF spiking matching Nengo's reference implementation ------
+    # Decrement refractory times
+    R_new = R - dt
 
-    # Voltage update for non-refractory neurons
-    refractory = (R > 0.5 * dt)  # boolean mask
-    dV = J * (1.0 - decay) + V * (decay - 1.0)  # = (J - V) * (1 - decay)
-    V_new = V + dV
-    V_new = torch.where(refractory, V, V_new)
-    V_new = torch.clamp(V_new, max=2.0)  # numerical stability
+    # Effective integration dt: neurons coming out of refractory mid-timestep
+    # get a partial timestep, allowing sub-timestep precision in spike rates.
+    delta_t = torch.clamp(dt - R_new, min=0.0, max=dt)
 
-    # Spike detection
-    if config.training:
-        spiked = spike_fn(V_new, threshold=1.0, sharpness=10.0)
-    else:
-        spiked = (V_new >= 1.0).to(J.dtype)
+    # Voltage update via exact exponential integration over effective dt
+    # V_new = J + (V - J) * exp(-delta_t / tau_rc)
+    #       = V + (J - V) * (1 - exp(-delta_t / tau_rc))
+    #       = V - (J - V) * expm1(-delta_t / tau_rc)
+    V_new = V - (J - V) * torch.expm1(-delta_t / tau_rc)
 
-    # Reset after spike
+    # Spike detection (strict greater-than, matching Nengo)
+    spiked = (V_new > 1.0).to(J.dtype)
+
+    # Sub-timestep spike time correction (matches Nengo's t_spike computation):
+    # t_spike = dt + tau_rc * log1p(-(V_new - 1) / (J - 1))
+    # This shifts the refractory start to the exact spike time rather than
+    # the end of the timestep, giving accurate inter-spike intervals.
+    J_minus_1 = J - 1.0
+    J_safe = torch.where(J_minus_1.abs() < 1e-8, torch.full_like(J_minus_1, 1e-8), J_minus_1)
+    t_spike = dt + tau_rc * torch.log1p(-(V_new - 1.0) / J_safe)
+    t_spike = torch.clamp(t_spike, min=0.0, max=dt)
+
+    # Clip voltage to min_voltage, then reset spiked neurons to 0
+    V_new = torch.clamp(V_new, min=float(min_voltage))
     V_new = V_new * (1.0 - spiked)
 
-    # Update refractory time
-    R_new = torch.clamp(R - dt, min=0.0)
-    R_new = torch.where(spiked.bool(), torch.full_like(R_new, tau_ref), R_new)
+    # Refractory time: tau_ref + t_spike for spiked neurons (precise refractoriness),
+    # decremented R for all others
+    R_new = torch.where(spiked.bool(), tau_ref + t_spike, R_new)
 
-    # Output: spike rate in Hz
+    # Output: amplitude / dt for spiked neurons
     output = spiked * (amplitude / dt)
 
     signals.scatter(op.output, output, mode="set")

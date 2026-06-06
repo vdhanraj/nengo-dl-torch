@@ -45,6 +45,7 @@ class BuildConfig:
     device: Any = None
     dtype: Any = None
     rng: Any = None
+    override_sigs: Any = None  # set of Signal objects injected externally this step
 
 
 class OpBuilder:

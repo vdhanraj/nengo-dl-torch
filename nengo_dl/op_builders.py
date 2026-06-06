@@ -61,6 +61,9 @@ class ResetBuilder(OpBuilder):
 
     def build_step(self, ops, signals, config):
         for dst, val in self._resets:
+            # Skip if this signal is being injected externally this step
+            if config.override_sigs and dst in config.override_sigs:
+                continue
             signals.scatter(dst, val, mode="set")
 
 
@@ -228,6 +231,10 @@ class SimPyFuncBuilder(OpBuilder):
             t_sig = fn_op["t"]
             x_sig = fn_op["x"]
             out_sig = fn_op["output"]
+
+            # Skip nodes whose output is being injected externally this step
+            if config.override_sigs and out_sig in config.override_sigs:
+                continue
 
             # Get current time (scalar)
             t_val = signals.gather(t_sig)
